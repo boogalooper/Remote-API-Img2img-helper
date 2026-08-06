@@ -326,7 +326,7 @@ function mainDialog(selection, initial, responseSeconds) {
     fillProviders(cfg.selectedProvider);
     fillModels(cfg.selectedModel);
     fillPromptPresets();
-    rebuildDynamic();
+    rebuildDynamic(true);
     updateMetadataButton();
     updatePromptPresetState();
     updateGenerateState();
@@ -342,14 +342,14 @@ function mainDialog(selection, initial, responseSeconds) {
         cfg.selectedProvider = cfg.data.selectedProvider = this.selection.itemId;
         fillModels("");
         isDirty = false;
-        rebuildDynamic();
+        rebuildDynamic(true);
     };
     modelList.onChange = function () {
         saveCurrent();
         if (!this.selection) return;
         cfg.selectedModel = cfg.data.selectedModel = this.selection.itemId;
         isDirty = false;
-        rebuildDynamic();
+        rebuildDynamic(true);
     };
     promptEdit.onChanging = function () { updateGenerateState(); updatePromptPresetState(); };
     promptEdit.onChange = function () { var p = currentProfile(); if (p) p.prompt = this.text; updateGenerateState(); updatePromptPresetState(); };
@@ -402,17 +402,17 @@ function mainDialog(selection, initial, responseSeconds) {
     };
     bSettings.onClick = function () {
         saveCurrent();
+        var selectedProviderBeforeSettings = cfg.selectedProvider,
+            selectedModelBeforeSettings = cfg.selectedModel,
+            resizeDirtyBeforeSettings = isDirty;
         if (showGlobalSettings(catalog)) {
-            // showGlobalSettings() заменяет cfg.data клоном. Обновляем ссылку
-            // на библиотеку пресетов, чтобы последующие изменения сохранялись
-            // в актуальный объект конфигурации, а не в старую копию.
-            promptPresetStore = cfg.getPromptPresetStore('positive');
-            fillPromptPresets();
-            updatePromptPresetState();
-            fillProviders(cfg.selectedProvider);
-            fillModels(cfg.selectedModel);
-            isDirty = false;
-            rebuildDynamic();
+            // Глобальные настройки применяются к cfg без замены modelProfiles.
+            // Поэтому текущая модель и её профиль остаются теми же, а повторное
+            // заполнение dropdownlist (которое запускало onChange) не требуется.
+            cfg.selectedProvider = cfg.data.selectedProvider = selectedProviderBeforeSettings;
+            cfg.selectedModel = cfg.data.selectedModel = selectedModelBeforeSettings;
+            isDirty = resizeDirtyBeforeSettings;
+            rebuildDynamic(false);
         }
     };
     bLoad.onClick = function () {
@@ -433,7 +433,7 @@ function mainDialog(selection, initial, responseSeconds) {
             fillProviders(cfg.selectedProvider);
             fillModels(cfg.selectedModel);
             isDirty = false;
-            rebuildDynamic();
+            rebuildDynamic(true);
         } catch (e) { ui.showErrorMessage(e); }
         updateMetadataButton();
     };
@@ -530,7 +530,10 @@ function mainDialog(selection, initial, responseSeconds) {
         // not to the newly selected model.
         var profileId = activeModelId || cfg.selectedModel,
             profile = profileId ? cfg.getModelProfile(profileId, findModel(catalog, profileId)) : null;
-        if (profile) profile.prompt = promptEdit.text;
+        if (profile) {
+            profile.prompt = promptEdit.text;
+            if (profile.autoResize && isDirty) profile.resizeDirty = true;
+        }
         if (profile && dynamic.aspectRatio) profile.aspectRatio = dynamic.aspectRatio.getValue();
         if (profile && dynamic.quality) profile.quality = dynamic.quality.getValue();
         if (providerList.selection) cfg.selectedProvider = cfg.data.selectedProvider = providerList.selection.itemId;
@@ -540,7 +543,7 @@ function mainDialog(selection, initial, responseSeconds) {
         var profileId = activeModelId || cfg.selectedModel;
         return profileId ? cfg.getModelProfile(profileId, findModel(catalog, profileId)) : null;
     }
-    function rebuildDynamic() {
+    function rebuildDynamic(resetAutoResizeOverride) {
         if (dynamicGroup) { try { dynamicGroup.visible = false; dynamicHost.remove(dynamicGroup); } catch (_) { } }
         dynamicGroup = dynamicHost.add("group{orientation:'column',alignChildren:['fill','top'],spacing:5,margins:0}");
         ui.setFixedWidth(dynamicGroup, ui.contentWidth());
@@ -549,6 +552,8 @@ function mainDialog(selection, initial, responseSeconds) {
         activeModelId = model ? String(model.id) : "";
         if (!model) { updateGenerateState(); return; }
         var profile = cfg.getModelProfile(model.id, model);
+        if (resetAutoResizeOverride && profile.autoResize) profile.resizeDirty = false;
+        isDirty = !!(profile.autoResize && profile.resizeDirty);
         promptEdit.text = profile.prompt || "";
         ui.addResizeControl(dynamicGroup, selection.bounds, profile, model);
         var controls = model.controls || {};
@@ -639,8 +644,21 @@ function showGlobalSettings(catalog) {
             temp.writeLayerMetadata = metadata.value;
             temp.selectBrush = selectBrush.value;
             temp.brushOpacity = clamp(Math.round(opacityControl.slider.value), 1, 100);
-            cfg.data = temp;
-            cfg.bindProperties();
+
+            // Применяем только глобальные поля. selectedProvider,
+            // selectedModel и modelProfiles остаются в исходном объекте cfg,
+            // поэтому сохранение этого окна не может сбросить рабочий профиль.
+            cfg.autoResize = cfg.data.autoResize = !!temp.autoResize;
+            cfg.resizePresets = cfg.data.resizePresets = cloneObj(temp.resizePresets);
+            cfg.flatten = cfg.data.flatten = !!temp.flatten;
+            cfg.rasterizeImage = cfg.data.rasterizeImage = !!temp.rasterizeImage;
+            cfg.keepAspectRatioDuringPlace = cfg.data.keepAspectRatioDuringPlace = !!temp.keepAspectRatioDuringPlace;
+            cfg.recordSettingsToAction = cfg.data.recordSettingsToAction = !!temp.recordSettingsToAction;
+            cfg.writeLayerMetadata = cfg.data.writeLayerMetadata = !!temp.writeLayerMetadata;
+            cfg.selectBrush = cfg.data.selectBrush = temp.selectBrush !== false;
+            cfg.brushOpacity = cfg.data.brushOpacity = temp.brushOpacity;
+            cfg.generationTimeout = cfg.data.generationTimeout = temp.generationTimeout;
+            cfg.providerCredentials = cfg.data.providerCredentials = cloneObj(temp.providerCredentials || {});
             accepted = true;
             w.close(1);
         } catch (e) { ui.showErrorMessage(e); }
@@ -978,6 +996,7 @@ function UI() {
         if (profile.autoResize === undefined) profile.autoResize = cfg.autoResize;
         if (profile.manualScale === undefined) profile.manualScale = 1;
         if (profile.resize === undefined) profile.resize = 1;
+        profile.resizeDirty = profile.resizeDirty === true;
         if (!profile.resizePreset) profile.resizePreset = presets.normalizeResizeName("", cfg.resizePresets);
         var multiple = model && model.input ? clamp(parseInt(model.input.dimension_multiple, 10) || 1, 1, 256) : 1,
             group = parent.add("group{orientation:'column',alignChildren:['fill','top'],spacing:0,margins:0}"),
@@ -1005,7 +1024,11 @@ function UI() {
         }
         function setSlider() {
             if (profile.autoResize) {
-                profile.resize = autoScale(bounds, presets.findResize(profile.resizePreset, cfg.resizePresets));
+                // При обычном показе интерфейса resizeDirty уже сброшен и
+                // значение рассчитывается заново. После возврата из глобальных
+                // настроек ручная поправка ползунка сохраняется.
+                if (!profile.resizeDirty)
+                    profile.resize = autoScale(bounds, presets.findResize(profile.resizePreset, cfg.resizePresets));
                 slider.value = profile.resize * 100; valueText.text = profile.resize.toFixed(2);
             } else {
                 slider.value = profile.manualScale * 100; profile.manualScale = Math.floor(slider.value) / 100; valueText.text = profile.manualScale.toFixed(2);
@@ -1014,14 +1037,31 @@ function UI() {
         }
         function sync() {
             var v = Math.floor(slider.value), scale = (v >= 97 && v <= 103) ? 1 : Math.max(0.01, v / 100);
-            if (profile.autoResize) profile.resize = scale;
-            else profile.manualScale = scale;
+            if (profile.autoResize) {
+                profile.resize = scale;
+                profile.resizeDirty = true;
+                isDirty = true;
+            } else {
+                profile.manualScale = scale;
+                profile.resizeDirty = false;
+                isDirty = false;
+            }
             valueText.text = (profile.autoResize ? profile.resize : profile.manualScale).toFixed(2); title.text = sizeText();
-            isDirty = true;
         }
         slider.onChanging = slider.onChange = sync;
-        checkbox.onClick = function () { profile.autoResize = this.value; setSlider(); };
-        presetList.onChange = function () { if (!this.selection) return; profile.resizePreset = cfg.resizePresets[this.selection.index].name; setSlider(); isDirty = true; };
+        checkbox.onClick = function () {
+            profile.autoResize = this.value;
+            if (profile.autoResize) profile.resizeDirty = false;
+            isDirty = false;
+            setSlider();
+        };
+        presetList.onChange = function () {
+            if (!this.selection) return;
+            profile.resizePreset = cfg.resizePresets[this.selection.index].name;
+            profile.resizeDirty = false;
+            isDirty = false;
+            setSlider();
+        };
         setSlider();
         return group;
     };
@@ -1141,7 +1181,9 @@ function GenerationRuntime() {
     };
     function getProfileTargetSize(bounds, profile, model) {
         var scale = profile.autoResize
-                ? (isDirty ? profile.resize : autoScale(bounds, presets.findResize(profile.resizePreset, cfg.resizePresets)))
+                ? ((profile.resizeDirty || isDirty)
+                    ? profile.resize
+                    : autoScale(bounds, presets.findResize(profile.resizePreset, cfg.resizePresets)))
                 : profile.manualScale,
             multiple = model && model.input ? clamp(parseInt(model.input.dimension_multiple, 10) || 1, 1, 256) : 1;
         return calculateSizeFromScale(bounds.width, bounds.height, scale || 1, multiple);
@@ -1163,7 +1205,9 @@ function GenerationRuntime() {
         }
     };
     function exportSelectionFile(selection, width, height, requestId) {
-        var hst = activeDocument.activeHistoryState, c = null;
+        var hst = activeDocument.activeHistoryState,
+            hiddenLayerIds = [],
+            c = null;
         try { c = doc.getProperty("center").value; } catch (_) { }
         var folder = new Folder(Folder.temp.fsName + "/" + APP.tempFolder);
         if (!folder.exists) folder.create();
@@ -1172,10 +1216,25 @@ function GenerationRuntime() {
             if (cfg.flatten) {
                 if (!selection.flattenedSource) throw new Error(cardText(str.errFlattenedSourceMissing));
                 doc.selectLayersByIDs([selection.flattenedSource]);
-            } else hideLayersAboveSource(selection.junk);
+            } else {
+                hiddenLayerIds = hideLayersAboveSource(selection.junk);
+            }
             doc.makeSelection(selection.bounds); doc.crop(true); doc.flatten(); resizeDocument(width, height); doc.saveACopy(inputFile);
         } finally {
             activeDocument.activeHistoryState = hst;
+
+            // Photoshop не всегда полностью возвращает индивидуальные флаги
+            // видимости после Hide + Crop + Flatten. Поэтому показываем только
+            // верхнеуровневые слои и целые группы, которые скрипт сам скрыл и
+            // которые до экспорта были видимы. Вложенная видимость групп при
+            // этом не изменяется.
+            if (hiddenLayerIds.length) {
+                try {
+                    doc.selectLayersByIDs(hiddenLayerIds);
+                    doc.showSelectedLayers();
+                    doc.selectLayersByIDs([selection.junk]);
+                } catch (_) { }
+            }
             if (c) try { doc.setProperty("center", c); } catch (_) { }
         }
         if (!inputFile.exists) throw new Error(cardText(str.errSaveJpeg));
@@ -1188,12 +1247,53 @@ function GenerationRuntime() {
         }
         function hideLayersAboveSource(layerId) {
             var length = doc.getProperty("numberOfLayers"),
-                from = lr.getProperty("itemIndex", false, layerId) + (doc.getProperty("hasBackgroundLayer") ? 0 : 1), ids = [];
+                from = lr.getProperty("itemIndex", false, layerId) +
+                    (doc.getProperty("hasBackgroundLayer") ? 0 : 1),
+                ids = [],
+                groupDepth = 0;
+
+            // Индексы перебираются снизу вверх. Для самостоятельной группы
+            // сначала встречается layerSectionEnd, затем её содержимое и после
+            // него layerSectionStart. Пока groupDepth > 0, вложенные элементы
+            // пропускаются; в список добавляется только ID самой внешней группы.
+            // layerSectionStart при depth == 0 относится к родительской группе
+            // исходного слоя — скрывать её нельзя.
             for (var i = from; i <= length; i++) {
-                var section = lr.getProperty("layerSection", false, i, true);
-                if (section && section.value == "layerSectionContent") ids.push(lr.getProperty("layerID", false, i, true));
+                var section = lr.getProperty("layerSection", false, i, true),
+                    sectionValue = section ? section.value : "";
+
+                if (sectionValue == "layerSectionEnd") {
+                    groupDepth++;
+                    continue;
+                }
+                if (sectionValue == "layerSectionStart") {
+                    if (groupDepth > 0) {
+                        groupDepth--;
+                        if (groupDepth == 0) addVisibleLayer(i);
+                    }
+                    continue;
+                }
+                if (sectionValue == "layerSectionContent" && groupDepth == 0)
+                    addVisibleLayer(i);
             }
-            if (from <= length && ids.length) { doc.selectLayersByIDs(ids); doc.hideSelectedLayers(); }
+            if (from <= length && ids.length) {
+                doc.selectLayersByIDs(ids);
+                doc.hideSelectedLayers();
+            }
+            return ids;
+
+            function addVisibleLayer(index) {
+                var id = lr.getProperty("layerID", false, index, true),
+                    visible = true,
+                    duplicate = false;
+                try { visible = !!lr.getProperty("visible", false, id); }
+                catch (_) { }
+                if (!visible) return;
+                for (var n = 0; n < ids.length; n++) {
+                    if (ids[n] == id) { duplicate = true; break; }
+                }
+                if (!duplicate) ids.push(id);
+            }
         }
     }
     function generatedImageToLayer(resultFile, selection) {
@@ -1648,6 +1748,7 @@ function Config() {
             autoResize: self.autoResize,
             resizePreset: presets.normalizeResizeName("", self.resizePresets),
             resize: 1,
+            resizeDirty: false,
             manualScale: 1,
             aspectRatio: defaultAspect,
             quality: defaultQuality,
@@ -1657,6 +1758,7 @@ function Config() {
         if (profile.autoResize === undefined) profile.autoResize = self.autoResize;
         if (!profile.resizePreset) profile.resizePreset = presets.normalizeResizeName("", self.resizePresets);
         if (profile.resize === undefined) profile.resize = 1;
+        profile.resizeDirty = profile.resizeDirty === true;
         if (profile.manualScale === undefined) profile.manualScale = 1;
         if (model && model.controls && model.controls.aspect_ratio && !controlHasOption(model, "aspect_ratio", profile.aspectRatio)) profile.aspectRatio = defaultAspect;
         else if (profile.aspectRatio === undefined) profile.aspectRatio = defaultAspect;
@@ -1709,6 +1811,7 @@ function Config() {
             autoResize: profile.autoResize !== false,
             resizePreset: String(profile.resizePreset || ""),
             resize: Number(profile.resize === undefined ? 1 : profile.resize),
+            resizeDirty: profile.resizeDirty === true,
             manualScale: Number(profile.manualScale === undefined ? 1 : profile.manualScale),
             aspectRatio: String(profile.aspectRatio || ""),
             quality: String(profile.quality || ""),
@@ -2073,6 +2176,12 @@ function AM(target, order) {
         var desc = new AD(); desc.putList(s2t("null"), list);
         executeAction(s2t("hide"), desc, DialogModes.NO);
     };
+    this.showSelectedLayers = function () {
+        var ref = new AR(); ref.putEnumerated(s2t("layer"), s2t("ordinal"), s2t("targetEnum"));
+        var list = new ActionList(); list.putReference(ref);
+        var desc = new AD(); desc.putList(s2t("null"), list);
+        executeAction(s2t("show"), desc, DialogModes.NO);
+    };
     this.setName = function (name) {
         var ref = new AR(); ref.putEnumerated(s2t("layer"), s2t("ordinal"), s2t("targetEnum"));
         var desc = new AD(); desc.putReference(s2t("null"), ref);
@@ -2262,9 +2371,9 @@ function Presets() {
     this.createResize = function (name, minSide, maxMp) { return { name: name, minSide: minSide, maxMp: maxMp }; };
     this.defaultResize = function () {
         return [
-            self.createResize('1K', 512, 1.1),
-            self.createResize('2K', 1024, 4.2),
-            self.createResize('4K', 2048, 16.8)
+            self.createResize('1K', 1024, 1.1),
+            self.createResize('2K', 2048, 4.2),
+            self.createResize('4K', 4096, 16.8)
         ];
     };
     this.findResizeIndex = function (name, list) {
