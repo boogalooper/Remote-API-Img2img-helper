@@ -1,0 +1,31 @@
+{
+  "provider": "genapi",
+  "model": "gemini-flash-image",
+  "label": "Gemini 2.5 Flash Image",
+  "reference": true,
+  "input_field": "image_urls[]",
+  "reference_field": "image_urls[]",
+  "reference_documented": true,
+  "request": {
+    "num_images": 1,
+    "output_format": "jpeg",
+    "is_sync": false,
+    "translate_input": false
+  },
+  "aspect_ratio": {
+    "param": "aspect_ratio",
+    "default": "selection",
+    "values": [
+      "1:1",
+      "2:3",
+      "3:2",
+      "3:4",
+      "4:3",
+      "4:5",
+      "5:4",
+      "9:16",
+      "16:9",
+      "21:9"
+    ]
+  }
+}

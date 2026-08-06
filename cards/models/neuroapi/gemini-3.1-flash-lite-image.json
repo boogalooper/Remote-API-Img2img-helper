@@ -1,0 +1,24 @@
+{
+  "provider": "neuroapi",
+  "model": "gemini-3.1-flash-lite-image",
+  "label": "Gemini 3.1 Flash Lite Image",
+  "reference": true,
+  "size_map": {
+    "param": "size",
+    "default": "1K",
+    "values": {
+      "1K": {
+        "1:1": "1024x1024",
+        "2:3": "848x1264",
+        "3:2": "1264x848",
+        "3:4": "896x1200",
+        "4:3": "1200x896",
+        "4:5": "928x1152",
+        "5:4": "1152x928",
+        "9:16": "768x1376",
+        "16:9": "1376x768",
+        "21:9": "1584x672"
+      }
+    }
+  }
+}

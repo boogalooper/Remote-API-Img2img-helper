@@ -1,0 +1,23 @@
+{
+  "id": "genapi",
+  "label": "GenAPI",
+  "base_url": "https://api.gen-api.ru",
+  "credentials": [
+    {
+      "id": "api_key",
+      "label": "API key",
+      "type": "secret",
+      "required": true
+    }
+  ],
+  "routes": {
+    "images_edit": {
+      "adapter": "genapi_async",
+      "method": "POST",
+      "path": "/api/v1/networks/{network_id}",
+      "result_path": "/api/v1/request/get/{request_id}",
+      "multipart_image_field": "image_urls[]",
+      "poll_interval_seconds": 3
+    }
+  }
+}

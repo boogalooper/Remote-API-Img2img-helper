@@ -1,0 +1,32 @@
+{
+  "provider": "genapi",
+  "model": "gpt-image-2",
+  "label": "GPT Image 2",
+  "reference": true,
+  "input_field": "image_urls[]",
+  "reference_field": "image_urls[]",
+  "reference_documented": true,
+  "request": {
+    "num_images": 1,
+    "output_format": "png",
+    "is_sync": false
+  },
+  "aspect_ratio": {
+    "param": "image_size",
+    "default": "selection",
+    "values": [
+      "1024x1024",
+      "1024x1536",
+      "1536x1024"
+    ]
+  },
+  "quality": {
+    "param": "quality",
+    "default": "low",
+    "values": [
+      "low",
+      "medium",
+      "high"
+    ]
+  }
+}

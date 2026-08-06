@@ -1,0 +1,30 @@
+{
+  "provider": "genapi",
+  "model": "nano-banana",
+  "label": "Nano Banana",
+  "reference": true,
+  "input_field": "image_urls[]",
+  "reference_field": "image_urls[]",
+  "reference_documented": true,
+  "request": {
+    "num_images": 1,
+    "output_format": "png",
+    "translate_input": false
+  },
+  "aspect_ratio": {
+    "param": "aspect_ratio",
+    "default": "selection",
+    "values": [
+      "default",
+      "1:1",
+      "2:3",
+      "3:2",
+      "3:4",
+      "4:3",
+      "4:5",
+      "5:4",
+      "9:16",
+      "16:9"
+    ]
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "provider": "bothub",
+  "model": "gemini-3.1-flash-image-preview",
+  "label": "Gemini 3.1 Flash Image Preview",
+  "reference": true,
+  "aspect_ratio": {
+    "param": "aspectRatio",
+    "values": [
+      "1:1",
+      "2:3",
+      "3:2",
+      "3:4",
+      "4:3",
+      "4:5",
+      "5:4",
+      "16:9",
+      "9:16",
+      "21:9"
+    ]
+  },
+  "quality": {
+    "param": "resolution",
+    "default": "1K",
+    "values": [
+      "1K",
+      "2K",
+      "4K"
+    ]
+  }
+}

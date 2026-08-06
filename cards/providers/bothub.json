@@ -1,0 +1,32 @@
+{
+  "id": "bothub",
+  "label": "BotHub",
+  "base_url": "https://bothub.chat/api/v2",
+  "credentials": [
+    {
+      "id": "api_key",
+      "label": "API key",
+      "type": "secret",
+      "required": true
+    }
+  ],
+  "routes": {
+    "images_edit": {
+      "adapter": "openai_images_edit",
+      "method": "POST",
+      "path": "/openai/v1/images/edits",
+      "request_defaults": {
+        "responseFormat": "b64_json"
+      },
+      "response": {
+        "base64_fields": [
+          "b64_json",
+          "b64Json"
+        ],
+        "url_fields": [
+          "url"
+        ]
+      }
+    }
+  }
+}

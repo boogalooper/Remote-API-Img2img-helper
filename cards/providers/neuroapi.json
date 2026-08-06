@@ -1,0 +1,20 @@
+{
+  "id": "neuroapi",
+  "label": "NeuroAPI",
+  "base_url": "https://neuroapi.host",
+  "credentials": [
+    {
+      "id": "api_key",
+      "label": "API key",
+      "type": "secret",
+      "required": true
+    }
+  ],
+  "routes": {
+    "images_edit": {
+      "adapter": "openai_images_edit",
+      "method": "POST",
+      "path": "/v1/images/edits"
+    }
+  }
+}

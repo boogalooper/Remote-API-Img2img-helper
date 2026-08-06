@@ -1,0 +1,40 @@
+{
+  "provider": "genapi",
+  "model": "nano-banana-2",
+  "label": "Nano Banana 2",
+  "reference": true,
+  "input_field": "image_urls[]",
+  "reference_field": "image_urls[]",
+  "reference_documented": true,
+  "request": {
+    "num_images": 1,
+    "output_format": "png",
+    "is_sync": false,
+    "enable_web_search": false
+  },
+  "aspect_ratio": {
+    "param": "aspect_ratio",
+    "default": "selection",
+    "values": [
+      "1:1",
+      "2:3",
+      "3:2",
+      "3:4",
+      "4:3",
+      "4:5",
+      "5:4",
+      "9:16",
+      "16:9"
+    ]
+  },
+  "quality": {
+    "param": "resolution",
+    "default": "1K",
+    "values": [
+      "0.5K",
+      "1K",
+      "2K",
+      "4K"
+    ]
+  }
+}
