@@ -37,7 +37,8 @@ jobs:
           cp "README.md" "${PACKAGE_DIR}/"
           cp -R "cards" "${PACKAGE_DIR}/"
           cp -R "advanced" "${PACKAGE_DIR}/"
-
+          cp -R "lib" "${PACKAGE_DIR}/"
+          
           # Guard against accidentally publishing development files.
           find "${PACKAGE_DIR}" -type d -name "__pycache__" -prune -exec rm -rf {} +
           find "${PACKAGE_DIR}" -type f \( -name "*.pyc" -o -name "*.pyo" \) -delete

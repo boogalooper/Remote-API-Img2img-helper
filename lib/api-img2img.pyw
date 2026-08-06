@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Local API bridge for API img2img helper.
+"""Local API bridge for Remote API img2img helper.
 
 The process receives commands from Photoshop JSX over localhost sockets, reads
 bundled provider/model cards, encrypts API keys with Windows DPAPI, sends image
@@ -47,17 +47,42 @@ IDLE_TIMEOUT_SECONDS = 5 * 60
 TEMP_MAX_AGE_SECONDS = 24 * 60 * 60
 
 APP = {
-    "name": "API img2img helper",
-    "slug": "api-img2img-helper",
-    "data_folder": "API img2img helper",
-    "lock_file": "api-img2img.lock",
+    "name": "Remote API img2img helper",
+    "slug": "remote-api-img2img-helper",
+    "data_folder": "Remote API img2img helper",
+    "lock_file": "remote-api-img2img.lock",
     "runtime_file": "runtime.json",
-    "log_file": "api-img2img.log",
+    "log_file": "remote-api-img2img.log",
 }
 
 APP_NAME = APP["name"]
 SCRIPT_DIR = Path(__file__).resolve().parent
-CARDS_DIR = SCRIPT_DIR / "cards"
+
+
+def _find_cards_dir() -> Path:
+    """Find bundled cards for both supported installation layouts.
+
+    Supported layouts:
+      1. <jsx>/lib/api-img2img.pyw + <jsx>/lib/cards
+      2. <jsx>/api-img2img.pyw + <jsx>/cards
+
+    Mixed layouts are accepted as a fallback to make manual installation less
+    fragile. The directory nearest to the Python API always has priority.
+    """
+    candidates = [
+        SCRIPT_DIR / "cards",
+        SCRIPT_DIR / "lib" / "cards",
+    ]
+    if SCRIPT_DIR.name.lower() == "lib":
+        candidates.append(SCRIPT_DIR.parent / "cards")
+
+    for candidate in candidates:
+        if (candidate / "providers").is_dir() and (candidate / "models").is_dir():
+            return candidate
+    return candidates[0]
+
+
+CARDS_DIR = _find_cards_dir()
 
 
 def _local_appdata() -> Path:

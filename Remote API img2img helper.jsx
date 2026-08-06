@@ -2,11 +2,11 @@
 /*
 // BEGIN__HARVEST_EXCEPTION_ZSTRING
 <javascriptresource>
-<name>API img2img helper</name>
-<eventid>7ddf5f38-fb8c-4c0a-91c7-0d39b6f0c1a4</eventid>
+<name>Remote API img2img helper</name>
+<eventid>03c3cc32-600d-4e47-ad5c-2b11c0f5f176</eventid>
 <terminology><![CDATA[<< /Version 1
                         /Events <<
-                        /7ddf5f38-fb8c-4c0a-91c7-0d39b6f0c1a4 [(API img2img helper) <<
+                        /03c3cc32-600d-4e47-ad5c-2b11c0f5f176 [(Remote API img2img helper) <<
                             /recordSettingsToAction [(recorded settings) /boolean]
                         >>]
                         >>
@@ -18,16 +18,16 @@
 $.localize = true;
 
 var APP = {
-    name: "API img2img helper",
-    uuid: "7ddf5f38-fb8c-4c0a-91c7-0d39b6f0c1a4",
-    settingsFile: "API img2img helper.desc",
-    tempFolder: "API img2img helper",
+    name: "Remote API img2img helper",
+    uuid: "03c3cc32-600d-4e47-ad5c-2b11c0f5f176",
+    settingsFile: "Remote API img2img helper.desc",
+    tempFolder: "Remote API img2img helper",
     generatedLayerName: "generated image",
-    dialogEnvKey: "apiImg2imgHelperDialogMode",
-    cancelToken: "__API_IMG2IMG_HELPER_CANCELLED__",
+    dialogEnvKey: "remoteApiImg2imgHelperDialogMode",
+    cancelToken: "__REMOTE_API_IMG2IMG_HELPER_CANCELLED__",
     xmp: {
-        namespace: "http://ns.api-img2img-helper.local/generation/1.0/",
-        prefix: "ApiImg2imgHelper:",
+        namespace: "http://ns.remote-api-img2img-helper.local/generation/1.0/",
+        prefix: "RemoteApiImg2imgHelper:",
         property: "generationSettings"
     }
 },
@@ -654,7 +654,7 @@ function showGlobalSettings(catalog) {
         var toolbar = ui.addPresetToolbar(parent, ui.settingsControlWidth, str.presetRestore),
             presetList = toolbar.dropdown,
             minControl = presetSlider(parent, { title: str.minimumSide, min: 256, max: 4096, value: 512, step: 32, suffix: ' px' }),
-            maxControl = presetSlider(parent, { title: str.maximumMp, min: 10, max: 1200, value: 200, step: 10, suffix: ' MP' }),
+            maxControl = presetSlider(parent, { title: str.maximumMp, min: 10, max: 2000, value: 110, step: 10, suffix: ' MP' }),
             minSync = minControl.slider.onChange,
             maxSync = maxControl.slider.onChange;
         minControl.slider.onChange = function () { minSync.call(this); checkIntegrity(); };
@@ -985,7 +985,7 @@ function UI() {
             checkbox = titleRow.add("checkbox"),
             title = titleRow.add("statictext"),
             valueText = titleRow.add("statictext{justify:'right'}"),
-            slider = group.add("slider{minvalue:1,maxvalue:400}"),
+            slider = group.add("slider{minvalue:1,maxvalue:800}"),
             presetList = group.add("dropdownlist");
         self.setFixedWidth(group, self.contentWidth()); self.setFixedWidth(titleRow, self.contentWidth()); self.setFixedWidth(slider, self.contentWidth()); self.setFixedWidth(presetList, self.contentWidth());
         checkbox.preferredSize.width = self.autoResizeCheckboxWidth;
@@ -1482,10 +1482,14 @@ function BridgeApi() {
     function findPythonModule() {
         var base = (new File($.fileName)).parent,
             candidates = [
-                new File(base.fsName + "/" + API_FILE + ".pyw"),
-                new File(base.fsName + "/" + API_FILE + ".py"),
+                // Рекомендуемая структура релиза: Python API и cards находятся
+                // в lib. Этот путь проверяется первым, чтобы старая копия API,
+                // случайно оставшаяся рядом с JSX, не получила приоритет.
                 new File(base.fsName + "/lib/" + API_FILE + ".pyw"),
-                new File(base.fsName + "/lib/" + API_FILE + ".py")
+                new File(base.fsName + "/lib/" + API_FILE + ".py"),
+                // Плоская структура также поддерживается.
+                new File(base.fsName + "/" + API_FILE + ".pyw"),
+                new File(base.fsName + "/" + API_FILE + ".py")
             ];
         for (var i = 0; i < candidates.length; i++) if (candidates[i].exists) return candidates[i];
         return null;
@@ -2238,12 +2242,12 @@ function autoScale(bounds, preset) {
         limitedByMaxArea = true;
     }
     scale = limitedByMaxArea ? Math.floor(scale * 1000000) / 1000000 : Math.ceil(scale * 1000000) / 1000000;
-    if (scale > 4) scale = 4;
+    if (scale > 8) scale = 8;
     return scale > 0 ? scale : 0.000001;
 }
 function Presets() {
     var self = this,
-        protectedResizeNames = ['SD', 'SDXL', 'FLUX/QWEN'],
+        protectedResizeNames = ['1K', '2K', '4K'],
         promptDefaults = { positive: {}, negative: {} };
     this.defaultPrompt = function () { return cloneObj(promptDefaults); };
     this.promptStore = function (config, context) {
@@ -2258,10 +2262,9 @@ function Presets() {
     this.createResize = function (name, minSide, maxMp) { return { name: name, minSide: minSide, maxMp: maxMp }; };
     this.defaultResize = function () {
         return [
-            self.createResize('SD', 512, 1.5),
-            self.createResize('SDXL', 640, 2),
-            self.createResize('FLUX/QWEN', 512, 2),
-            self.createResize('HiRes', 1024, 4)
+            self.createResize('1K', 512, 1.1),
+            self.createResize('2K', 1024, 4.2),
+            self.createResize('4K', 2048, 16.8)
         ];
     };
     this.findResizeIndex = function (name, list) {
