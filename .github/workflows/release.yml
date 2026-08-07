@@ -25,21 +25,18 @@ jobs:
           set -euo pipefail
 
           VERSION="${GITHUB_REF_NAME#v}"
-          PACKAGE_NAME="API-img2img-helper-${VERSION}"
+          PACKAGE_NAME="Remote-API-img2img-helper-${VERSION}"
           PACKAGE_DIR="dist/${PACKAGE_NAME}"
 
           rm -rf dist
           mkdir -p "${PACKAGE_DIR}"
 
-          # Files required to run the script.
-          cp "API img2img helper.jsx" "${PACKAGE_DIR}/"
-          cp "api-img2img.pyw" "${PACKAGE_DIR}/"
+          cp "Remote API img2img helper.jsx" "${PACKAGE_DIR}/"
           cp "README.md" "${PACKAGE_DIR}/"
-          cp -R "cards" "${PACKAGE_DIR}/"
-          cp -R "advanced" "${PACKAGE_DIR}/"
           cp -R "lib" "${PACKAGE_DIR}/"
-          
-          # Guard against accidentally publishing development files.
+          cp -R "advanced" "${PACKAGE_DIR}/"
+
+          # Remove development cache files if present.
           find "${PACKAGE_DIR}" -type d -name "__pycache__" -prune -exec rm -rf {} +
           find "${PACKAGE_DIR}" -type f \( -name "*.pyc" -o -name "*.pyo" \) -delete
 
@@ -65,11 +62,11 @@ jobs:
           set -euo pipefail
 
           VERSION="${GITHUB_REF_NAME#v}"
-          ARCHIVE="dist/API-img2img-helper-${VERSION}.zip"
+          ARCHIVE="dist/Remote-API-img2img-helper-${VERSION}.zip"
 
           gh release create "${GITHUB_REF_NAME}" \
             "${ARCHIVE}" \
             --verify-tag \
-            --title "API img2img helper ${VERSION}" \
+            --title "Remote API img2img helper ${VERSION}" \
             --notes-file release-notes.md \
             --latest
