@@ -5,6 +5,13 @@ on:
     tags:
       - "v*"
 
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (optional; by default read from VER in JSX)"
+        required: false
+        type: string
+
 permissions:
   contents: write
 
@@ -19,12 +26,53 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Prepare release package
+      - name: Resolve release version
+        id: release
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
 
-          VERSION="${GITHUB_REF_NAME#v}"
+          JSX_FILE="Remote API img2img helper.jsx"
+          JSX_VERSION="$(sed -nE 's/^[[:space:]]*VER[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "${JSX_FILE}" | head -n 1)"
+
+          if [ -z "${JSX_VERSION}" ]; then
+            echo "Cannot read VER from ${JSX_FILE}"
+            exit 1
+          fi
+
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            TAG="${GITHUB_REF_NAME}"
+            VERSION="${TAG#v}"
+          else
+            VERSION="${INPUT_VERSION#v}"
+            if [ -z "${VERSION}" ]; then
+              VERSION="${JSX_VERSION}"
+            fi
+            TAG="v${VERSION}"
+          fi
+
+          if ! [[ "${VERSION}" =~ ^[0-9]+([.][0-9]+)*$ ]]; then
+            echo "Invalid version: ${VERSION}"
+            exit 1
+          fi
+
+          if [ "${VERSION}" != "${JSX_VERSION}" ]; then
+            echo "Release version ${VERSION} does not match JSX VER ${JSX_VERSION}"
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+
+      - name: Prepare release package
+        shell: bash
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+
           PACKAGE_NAME="Remote-API-img2img-helper-${VERSION}"
           PACKAGE_DIR="dist/${PACKAGE_NAME}"
 
@@ -36,7 +84,6 @@ jobs:
           cp -R "lib" "${PACKAGE_DIR}/"
           cp -R "advanced" "${PACKAGE_DIR}/"
 
-          # Remove development cache files if present.
           find "${PACKAGE_DIR}" -type d -name "__pycache__" -prune -exec rm -rf {} +
           find "${PACKAGE_DIR}" -type f \( -name "*.pyc" -o -name "*.pyo" \) -delete
 
@@ -55,18 +102,33 @@ jobs:
           } > release-notes.md
 
       - name: Publish GitHub release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: bash
+          VERSION: ${{ steps.release.outputs.version }}
+          TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
 
-          VERSION="${GITHUB_REF_NAME#v}"
           ARCHIVE="dist/Remote-API-img2img-helper-${VERSION}.zip"
 
-          gh release create "${GITHUB_REF_NAME}" \
-            "${ARCHIVE}" \
-            --verify-tag \
-            --title "Remote API img2img helper ${VERSION}" \
-            --notes-file release-notes.md \
-            --latest
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists"
+            exit 1
+          fi
+
+          if git rev-parse "${TAG}^{commit}" >/dev/null 2>&1; then
+            gh release create "${TAG}" \
+              "${ARCHIVE}" \
+              --verify-tag \
+              --title "Remote API img2img helper ${VERSION}" \
+              --notes-file release-notes.md \
+              --latest
+          else
+            gh release create "${TAG}" \
+              "${ARCHIVE}" \
+              --target "${GITHUB_SHA}" \
+              --title "Remote API img2img helper ${VERSION}" \
+              --notes-file release-notes.md \
+              --latest
+          fi
