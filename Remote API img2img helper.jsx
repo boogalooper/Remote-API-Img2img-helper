@@ -31,7 +31,7 @@ var APP = {
         property: "generationSettings"
     }
 },
-    VER = "0.12",
+    VER = "0.121",
     SETTINGS_DATA_VERSION = 1,
     ACTION_DATA_VERSION = 3,
     // Отладочный флаг должен оставаться false в рабочей сборке. При true
@@ -160,15 +160,14 @@ function init() {
     if (!selection.result) return;
 
     try {
-        var apiResponsive = false;
-        if (api.isRunning()) {
-            try { api.ping(null, 1000); apiResponsive = true; } catch (_) { }
-        }
-        if (!apiResponsive) {
+        // Один дешёвый TCP-check определяет, нужно ли показывать прогресс запуска.
+        // Сам ping выполняется только один раз внутри initialize().
+        var apiRunning = api.isRunning();
+        if (!apiRunning) {
             startupProgress = ui.createStartupProgress(str.progressStartPython, START_TIMEOUT);
             startupProgress.show();
         }
-        api.initialize(startupProgress);
+        api.initialize(startupProgress, apiRunning);
         if (startupProgress) startupProgress.setStage(str.progressHandshake, 25);
         var initial = api.handshake(startupProgress),
             catalog = initial && initial.catalog ? initial.catalog : { providers: [], models: [], invalid_cards: [] };
@@ -1429,14 +1428,27 @@ function LayerMetadata() {
 function BridgeApi() {
     var self = this;
     this.isRunning = function () { return checkConnection(API_HOST, API_PORT_SEND); };
-    this.initialize = function (progress) {
+    this.initialize = function (progress, knownRunning) {
+        // init() уже делает TCP-check, чтобы решить, показывать ли progress. Не
+        // повторяем его на обычном тёплом запуске и не ищем Python-файл, пока
+        // действительно не понадобится запуск нового процесса.
+        var running = knownRunning === undefined ? self.isRunning() : !!knownRunning,
+            runningInfo = null;
+        if (running) {
+            try { runningInfo = self.ping(progress); }
+            catch (pingError) {
+                // Редкая гонка: процесс мог завершиться между TCP-check и ping.
+                // Дополнительный check выполняется только после ошибки.
+                if (self.isRunning()) throw pingError;
+                running = false;
+            }
+            if (running) {
+                if (String(runningInfo.protocol) != String(API_PROTOCOL)) throw new Error(cardText(str.errApiProtocolA) + runningInfo.protocol + cardText(str.errApiProtocolB) + API_PROTOCOL + ".");
+                return true;
+            }
+        }
         var pythonFile = findPythonModule();
         if (!pythonFile) throw new Error(cardText(str.errPythonMissingA) + API_FILE + cardText(str.errPythonMissingB));
-        if (self.isRunning()) {
-            var running = self.ping(progress);
-            if (String(running.protocol) != String(API_PROTOCOL)) throw new Error(cardText(str.errApiProtocolA) + running.protocol + cardText(str.errApiProtocolB) + API_PROTOCOL + ".");
-            return true;
-        }
         if (progress) progress.setStage(str.progressStartPython, 3);
         pythonFile.execute();
         if (!waitForConnection(START_TIMEOUT, progress)) throw new Error(cardText(str.errPythonStartA) + API_HOST + ":" + API_PORT_SEND + cardText(str.errPythonStartB));
