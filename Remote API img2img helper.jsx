@@ -16,7 +16,7 @@
 */
 
 $.localize = true;
-
+//$.locale = 'ru';
 var APP = {
     name: "Remote API img2img helper",
     uuid: "03c3cc32-600d-4e47-ad5c-2b11c0f5f176",
@@ -31,7 +31,7 @@ var APP = {
         property: "generationSettings"
     }
 },
-    VER = "0.11",
+    VER = "0.12",
     SETTINGS_DATA_VERSION = 1,
     ACTION_DATA_VERSION = 3,
     // Отладочный флаг должен оставаться false в рабочей сборке. При true
@@ -291,6 +291,8 @@ function mainDialog(selection, initial, responseSeconds) {
         providerList = w.add("dropdownlist"),
         modelLabel = w.add("statictext", undefined, str.model),
         modelList = w.add("dropdownlist"),
+        commentLabel = w.add("statictext", undefined, str.modelComment),
+        commentEdit = w.add("edittext", undefined, ""),
         promptLabel = w.add("statictext", undefined, str.prompt),
         promptToolbar = ui.addPresetToolbar(w, ui.contentWidth(), str.promptClear),
         promptEdit = w.add("edittext", undefined, "", { multiline: true, scrollable: true }),
@@ -318,6 +320,8 @@ function mainDialog(selection, initial, responseSeconds) {
     ui.setFixedWidth(bSettings, ui.mainSettingsButtonWidth);
     ui.setFixedWidth(providerList, ui.contentWidth());
     ui.setFixedWidth(modelList, ui.contentWidth());
+    ui.setFixedWidth(commentEdit, ui.contentWidth());
+    commentEdit.helpTip = str.modelCommentHelp;
     promptEdit.preferredSize = [ui.contentWidth(), 92];
     ui.setFixedWidth(promptToolbar.row, ui.contentWidth());
     translateButton.preferredSize.width = ui.contentWidth();
@@ -351,6 +355,7 @@ function mainDialog(selection, initial, responseSeconds) {
         isDirty = false;
         rebuildDynamic(true);
     };
+    commentEdit.onChange = function () { var p = currentProfile(); if (p) p.comment = String(this.text || ""); };
     promptEdit.onChanging = function () { updateGenerateState(); updatePromptPresetState(); };
     promptEdit.onChange = function () { var p = currentProfile(); if (p) p.prompt = this.text; updateGenerateState(); updatePromptPresetState(); };
     translateButton.onClick = function () {
@@ -531,6 +536,7 @@ function mainDialog(selection, initial, responseSeconds) {
         var profileId = activeModelId || cfg.selectedModel,
             profile = profileId ? cfg.getModelProfile(profileId, findModel(catalog, profileId)) : null;
         if (profile) {
+            profile.comment = String(commentEdit.text || "");
             profile.prompt = promptEdit.text;
             if (profile.autoResize && isDirty) profile.resizeDirty = true;
         }
@@ -554,6 +560,7 @@ function mainDialog(selection, initial, responseSeconds) {
         var profile = cfg.getModelProfile(model.id, model);
         if (resetAutoResizeOverride && profile.autoResize) profile.resizeDirty = false;
         isDirty = !!(profile.autoResize && profile.resizeDirty);
+        commentEdit.text = profile.comment || "";
         promptEdit.text = profile.prompt || "";
         ui.addResizeControl(dynamicGroup, selection.bounds, profile, model);
         var controls = model.controls || {};
@@ -1744,6 +1751,7 @@ function Config() {
             defaultAspect = controlOptionId(model, "aspect_ratio", "selection"),
             defaultQuality = controlOptionId(model, "quality", "");
         if (!isObjectMap(profile)) profile = self.modelProfiles[key] = {
+            comment: "",
             prompt: "",
             autoResize: self.autoResize,
             resizePreset: presets.normalizeResizeName("", self.resizePresets),
@@ -1754,6 +1762,7 @@ function Config() {
             quality: defaultQuality,
             reference: ""
         };
+        profile.comment = profile.comment === undefined || profile.comment === null ? "" : String(profile.comment);
         profile.prompt = profile.prompt === undefined || profile.prompt === null ? "" : String(profile.prompt);
         if (profile.autoResize === undefined) profile.autoResize = self.autoResize;
         if (!profile.resizePreset) profile.resizePreset = presets.normalizeResizeName("", self.resizePresets);
@@ -1801,6 +1810,17 @@ function Config() {
         for (var i = 0; i < globalKeys.length; i++) {
             var key = globalKeys[i];
             target[key] = target.data[key] = cloneObj(self[key]);
+        }
+        // Комментарий относится к модели, но не является параметром генерации.
+        // Поэтому он всегда живёт в глобальном DESC и не записывается в Action.
+        var modelId = String(self.selectedModel || ""),
+            profileKey = modelId ? settingsKey(modelId) : "",
+            sourceProfile = profileKey && isObjectMap(self.modelProfiles) ? self.modelProfiles[profileKey] : null;
+        if (profileKey && isObjectMap(sourceProfile)) {
+            if (!isObjectMap(target.modelProfiles)) target.modelProfiles = target.data.modelProfiles = {};
+            var targetProfile = target.modelProfiles[profileKey];
+            if (!isObjectMap(targetProfile)) targetProfile = target.modelProfiles[profileKey] = {};
+            targetProfile.comment = sourceProfile.comment === undefined || sourceProfile.comment === null ? "" : String(sourceProfile.comment);
         }
         target.cleanReferenceHistory();
     };
@@ -1893,7 +1913,12 @@ function Config() {
         self.selectedProvider = self.data.selectedProvider = String(loaded.selectedProvider);
         self.selectedModel = self.data.selectedModel = String(loaded.selectedModel);
         if (!isObjectMap(self.modelProfiles)) self.modelProfiles = self.data.modelProfiles = {};
-        self.modelProfiles[settingsKey(self.selectedModel)] = modelProfileData(loaded.modelProfile);
+        var profileKey = settingsKey(self.selectedModel),
+            storedProfile = self.modelProfiles[profileKey],
+            storedComment = isObjectMap(storedProfile) && storedProfile.comment !== undefined && storedProfile.comment !== null ? String(storedProfile.comment) : "",
+            actionProfile = modelProfileData(loaded.modelProfile);
+        actionProfile.comment = storedComment;
+        self.modelProfiles[profileKey] = actionProfile;
     };
     this.saveToAction = function (recordMode) {
         syncData();
@@ -2261,7 +2286,7 @@ function Delay() {
 }
 function Locale() {
     var localized = {
-        provider: ["Провайдер", "Provider"], model: ["Модель", "Model"], prompt: ["Промпт", "Prompt"], generate: ["Генерировать", "Generate"],
+        provider: ["Провайдер", "Provider"], model: ["Модель", "Model"], modelComment: ["Комментарий", "Comment"], modelCommentHelp: ["Личная заметка о модели: цена генерации, особенности и т. п.", "Personal model note: generation cost, specifics, etc."], prompt: ["Промпт", "Prompt"], generate: ["Генерировать", "Generate"],
         translatePrompt: ['Перевести промпт на английский', 'Translate prompt to English'], selection: ['Выделение: ', 'Selection: '],
         resizePresetManagement: ['Профили автомасштаба', 'Auto-resize profiles'], resizePresetNew: ['Новый профиль', 'New profile'],
         resizePresetTitle: ['Профиль автомасштаба', 'Auto-resize profile'], resizePresetPrompt: ['Введите имя профиля автомасштаба:', 'Enter auto-resize profile name:'],
