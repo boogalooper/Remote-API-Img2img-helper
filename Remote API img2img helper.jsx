@@ -31,7 +31,7 @@ var APP = {
         property: "generationSettings"
     }
 },
-    VER = "0.121",
+    VER = "0.122",
     SETTINGS_DATA_VERSION = 1,
     ACTION_DATA_VERSION = 3,
     // Отладочный флаг должен оставаться false в рабочей сборке. При true
