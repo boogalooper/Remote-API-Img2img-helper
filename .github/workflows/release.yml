@@ -92,14 +92,44 @@ jobs:
 
       - name: Prepare release notes
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+
+          # The release being built does not exist on GitHub yet, so the latest
+          # published release is the previous one and can be used as the start point.
+          PREVIOUS_TAG=$(gh release list \
+            --exclude-drafts \
+            --exclude-pre-releases \
+            --limit 1 \
+            --json tagName \
+            --jq '.[0].tagName // empty')
 
           {
             echo "## История изменений"
             echo
-            git log -1 --format=%B
+
+            if [ -n "${PREVIOUS_TAG}" ]; then
+              echo "Изменения с ${PREVIOUS_TAG}:"
+              echo
+              git log "${PREVIOUS_TAG}..${GITHUB_SHA}" \
+                --reverse \
+                --no-merges \
+                --pretty=format:'- %s'
+              echo
+            else
+              # First release: there is no previous release to compare with.
+              git log "${GITHUB_SHA}" \
+                --reverse \
+                --no-merges \
+                --pretty=format:'- %s'
+              echo
+            fi
           } > release-notes.md
+
+          echo "Release notes:"
+          cat release-notes.md
 
       - name: Publish GitHub release
         shell: bash
