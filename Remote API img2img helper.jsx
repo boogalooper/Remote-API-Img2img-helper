@@ -31,7 +31,7 @@ var APP = {
         property: "generationSettings"
     }
 },
-    VER = "0.122",
+    VER = "0.123",
     SETTINGS_DATA_VERSION = 1,
     ACTION_DATA_VERSION = 3,
     // Отладочный флаг должен оставаться false в рабочей сборке. При true
@@ -66,7 +66,6 @@ var APP = {
     doc = new AM("document"),
     lr = new AM("layer"),
     layerMetadata = new LayerMetadata(),
-    isDirty = false,
     initialState = null,
     generationResultPlaced = false,
     startupProgress = null,
@@ -171,7 +170,10 @@ function init() {
         if (startupProgress) startupProgress.setStage(str.progressHandshake, 25);
         var initial = api.handshake(startupProgress),
             catalog = initial && initial.catalog ? initial.catalog : { providers: [], models: [], invalid_cards: [] };
-        if (actionPlaybackMode && actionUsesRecordedSettings) validateRecordedActionSelection(catalog);
+        if (actionPlaybackMode && actionUsesRecordedSettings) {
+            validateRecordedActionSelection(catalog);
+            validateRecordedActionCredential();
+        }
         var selectionChanged = normalizeCatalogSelection(catalog),
             notices = settingsWarnings.slice(0),
             responseSeconds = Math.round((((new Date()).getTime() - startupStartedAt) / 1000) * 100) / 100;
@@ -245,6 +247,13 @@ function validateRecordedActionSelection(catalog) {
     if (!model || String(model.provider) != providerId) {
         skipSettingsSaveOnError = true;
         throw new Error(String(cardText(str.errActionModelMissing)).replace("%1", modelId));
+    }
+}
+function validateRecordedActionCredential() {
+    var providerId = String(cfg.selectedProvider || "");
+    if (!hasProviderCredential(providerId)) {
+        skipSettingsSaveOnError = true;
+        throw new Error(String(cardText(str.errActionApiKeyMissing)).replace("%1", providerId));
     }
 }
 
@@ -329,7 +338,7 @@ function mainDialog(selection, initial, responseSeconds) {
     fillProviders(cfg.selectedProvider);
     fillModels(cfg.selectedModel);
     fillPromptPresets();
-    rebuildDynamic(true);
+    rebuildDynamic();
     updateMetadataButton();
     updatePromptPresetState();
     updateGenerateState();
@@ -344,15 +353,13 @@ function mainDialog(selection, initial, responseSeconds) {
         if (!this.selection) return;
         cfg.selectedProvider = cfg.data.selectedProvider = this.selection.itemId;
         fillModels("");
-        isDirty = false;
-        rebuildDynamic(true);
+        rebuildDynamic();
     };
     modelList.onChange = function () {
         saveCurrent();
         if (!this.selection) return;
         cfg.selectedModel = cfg.data.selectedModel = this.selection.itemId;
-        isDirty = false;
-        rebuildDynamic(true);
+        rebuildDynamic();
     };
     commentEdit.onChange = function () { var p = currentProfile(); if (p) p.comment = String(this.text || ""); };
     promptEdit.onChanging = function () { updateGenerateState(); updatePromptPresetState(); };
@@ -407,16 +414,14 @@ function mainDialog(selection, initial, responseSeconds) {
     bSettings.onClick = function () {
         saveCurrent();
         var selectedProviderBeforeSettings = cfg.selectedProvider,
-            selectedModelBeforeSettings = cfg.selectedModel,
-            resizeDirtyBeforeSettings = isDirty;
+            selectedModelBeforeSettings = cfg.selectedModel;
         if (showGlobalSettings(catalog)) {
             // Глобальные настройки применяются к cfg без замены modelProfiles.
             // Поэтому текущая модель и её профиль остаются теми же, а повторное
             // заполнение dropdownlist (которое запускало onChange) не требуется.
             cfg.selectedProvider = cfg.data.selectedProvider = selectedProviderBeforeSettings;
             cfg.selectedModel = cfg.data.selectedModel = selectedModelBeforeSettings;
-            isDirty = resizeDirtyBeforeSettings;
-            rebuildDynamic(false);
+            rebuildDynamic();
         }
     };
     bLoad.onClick = function () {
@@ -436,8 +441,7 @@ function mainDialog(selection, initial, responseSeconds) {
             fillPromptPresets(); updatePromptPresetState();
             fillProviders(cfg.selectedProvider);
             fillModels(cfg.selectedModel);
-            isDirty = false;
-            rebuildDynamic(true);
+            rebuildDynamic();
         } catch (e) { ui.showErrorMessage(e); }
         updateMetadataButton();
     };
@@ -537,7 +541,6 @@ function mainDialog(selection, initial, responseSeconds) {
         if (profile) {
             profile.comment = String(commentEdit.text || "");
             profile.prompt = promptEdit.text;
-            if (profile.autoResize && isDirty) profile.resizeDirty = true;
         }
         if (profile && dynamic.aspectRatio) profile.aspectRatio = dynamic.aspectRatio.getValue();
         if (profile && dynamic.quality) profile.quality = dynamic.quality.getValue();
@@ -548,7 +551,7 @@ function mainDialog(selection, initial, responseSeconds) {
         var profileId = activeModelId || cfg.selectedModel;
         return profileId ? cfg.getModelProfile(profileId, findModel(catalog, profileId)) : null;
     }
-    function rebuildDynamic(resetAutoResizeOverride) {
+    function rebuildDynamic() {
         if (dynamicGroup) { try { dynamicGroup.visible = false; dynamicHost.remove(dynamicGroup); } catch (_) { } }
         dynamicGroup = dynamicHost.add("group{orientation:'column',alignChildren:['fill','top'],spacing:5,margins:0}");
         ui.setFixedWidth(dynamicGroup, ui.contentWidth());
@@ -557,8 +560,6 @@ function mainDialog(selection, initial, responseSeconds) {
         activeModelId = model ? String(model.id) : "";
         if (!model) { updateGenerateState(); return; }
         var profile = cfg.getModelProfile(model.id, model);
-        if (resetAutoResizeOverride && profile.autoResize) profile.resizeDirty = false;
-        isDirty = !!(profile.autoResize && profile.resizeDirty);
         commentEdit.text = profile.comment || "";
         promptEdit.text = profile.prompt || "";
         ui.addResizeControl(dynamicGroup, selection.bounds, profile, model);
@@ -1002,7 +1003,7 @@ function UI() {
         if (profile.autoResize === undefined) profile.autoResize = cfg.autoResize;
         if (profile.manualScale === undefined) profile.manualScale = 1;
         if (profile.resize === undefined) profile.resize = 1;
-        profile.resizeDirty = profile.resizeDirty === true;
+        profile.resizeDirty = false;
         if (!profile.resizePreset) profile.resizePreset = presets.normalizeResizeName("", cfg.resizePresets);
         var multiple = model && model.input ? clamp(parseInt(model.input.dimension_multiple, 10) || 1, 1, 256) : 1,
             group = parent.add("group{orientation:'column',alignChildren:['fill','top'],spacing:0,margins:0}"),
@@ -1021,8 +1022,11 @@ function UI() {
         var presetIndex = presets.findResizeIndex(profile.resizePreset, cfg.resizePresets);
         presetList.selection = Math.max(0, presetIndex);
         profile.resizePreset = presets.findResize(profile.resizePreset, cfg.resizePresets).name;
+        function currentScale() {
+            return profile.autoResize ? profile.resize : profile.manualScale;
+        }
         function sizeText() {
-            var scale = profile.autoResize ? profile.resize : profile.manualScale,
+            var scale = currentScale(),
                 size = calculateSizeFromScale(bounds.width, bounds.height, scale, multiple),
                 text = profile.autoResize ? cardText(str.autoResize) : cardText(str.resize),
                 mp = Math.floor(size.width * size.height / 10000) / 100;
@@ -1030,42 +1034,43 @@ function UI() {
         }
         function setSlider() {
             if (profile.autoResize) {
-                // При обычном показе интерфейса resizeDirty уже сброшен и
-                // значение рассчитывается заново. После возврата из глобальных
-                // настроек ручная поправка ползунка сохраняется.
-                if (!profile.resizeDirty)
-                    profile.resize = autoScale(bounds, presets.findResize(profile.resizePreset, cfg.resizePresets));
-                slider.value = profile.resize * 100; valueText.text = profile.resize.toFixed(2);
+                profile.resize = autoScale(bounds, presets.findResize(profile.resizePreset, cfg.resizePresets));
+                slider.value = profile.resize * 100;
+                valueText.text = profile.resize.toFixed(2);
             } else {
-                slider.value = profile.manualScale * 100; profile.manualScale = Math.floor(slider.value) / 100; valueText.text = profile.manualScale.toFixed(2);
+                slider.value = profile.manualScale * 100;
+                profile.manualScale = Math.floor(slider.value) / 100;
+                valueText.text = profile.manualScale.toFixed(2);
             }
-            title.text = sizeText(); presetList.enabled = profile.autoResize;
+            title.text = sizeText();
+            presetList.enabled = profile.autoResize;
+            checkbox.value = !!profile.autoResize;
         }
         function sync() {
             var v = Math.floor(slider.value), scale = (v >= 97 && v <= 103) ? 1 : Math.max(0.01, v / 100);
             if (profile.autoResize) {
+                profile.autoResize = false;
+                profile.manualScale = scale;
                 profile.resize = scale;
-                profile.resizeDirty = true;
-                isDirty = true;
+                checkbox.value = false;
+                presetList.enabled = false;
             } else {
                 profile.manualScale = scale;
-                profile.resizeDirty = false;
-                isDirty = false;
             }
-            valueText.text = (profile.autoResize ? profile.resize : profile.manualScale).toFixed(2); title.text = sizeText();
+            profile.resizeDirty = false;
+            valueText.text = currentScale().toFixed(2);
+            title.text = sizeText();
         }
         slider.onChanging = slider.onChange = sync;
         checkbox.onClick = function () {
             profile.autoResize = this.value;
-            if (profile.autoResize) profile.resizeDirty = false;
-            isDirty = false;
+            profile.resizeDirty = false;
             setSlider();
         };
         presetList.onChange = function () {
             if (!this.selection) return;
             profile.resizePreset = cfg.resizePresets[this.selection.index].name;
             profile.resizeDirty = false;
-            isDirty = false;
             setSlider();
         };
         setSlider();
@@ -1187,9 +1192,7 @@ function GenerationRuntime() {
     };
     function getProfileTargetSize(bounds, profile, model) {
         var scale = profile.autoResize
-                ? ((profile.resizeDirty || isDirty)
-                    ? profile.resize
-                    : autoScale(bounds, presets.findResize(profile.resizePreset, cfg.resizePresets)))
+                ? autoScale(bounds, presets.findResize(profile.resizePreset, cfg.resizePresets))
                 : profile.manualScale,
             multiple = model && model.input ? clamp(parseInt(model.input.dimension_multiple, 10) || 1, 1, 256) : 1;
         return calculateSizeFromScale(bounds.width, bounds.height, scale || 1, multiple);
@@ -1375,6 +1378,7 @@ function prepareSelectionLayer(selection) { return generation.prepareSelectionLa
 function checkSelection(res) { return generation.checkSelection(res); }
 function placeResultHistory() { return generation.placeResultHistory(); }
 function runGenerationProgress() { return generationProgress.run(); }
+function progressWorkChunk(text) { return api.workChunk(text); }
 function generationStageOne() { return generationProgress.stageOne(); }
 function generationStageTwo() { return generationProgress.stageTwo(); }
 function fitSelectionBounds(res, multiple) {
@@ -1553,7 +1557,7 @@ function BridgeApi() {
                 var text = trackDelay
                     ? title + "\t " + Math.floor((t2 - t1) / 100) / 10 + " s. "
                     : title;
-                if (!app.doProgressTask(slice, "workChunk('" + escapeProgressText(text) + "');")) {
+                if (!app.doProgressTask(slice, "progressWorkChunk('" + escapeProgressText(text) + "');")) {
                     $.setenv(APP.dialogEnvKey, "true");
                     try { self.interrupt(expectedRequestId); } catch (_) { }
                     listener.close();
@@ -1588,10 +1592,10 @@ function BridgeApi() {
             $.sleep(1);
         }
     }
-    function workChunk(text) {
+    this.workChunk = function (text) {
         app.changeProgressText(text);
         $.sleep(0);
-    }
+    };
     function escapeProgressText(text) {
         return String(text)
             .replace(/\\/g, "\\\\")
@@ -1768,7 +1772,6 @@ function Config() {
             autoResize: self.autoResize,
             resizePreset: presets.normalizeResizeName("", self.resizePresets),
             resize: 1,
-            resizeDirty: false,
             manualScale: 1,
             aspectRatio: defaultAspect,
             quality: defaultQuality,
@@ -1779,7 +1782,7 @@ function Config() {
         if (profile.autoResize === undefined) profile.autoResize = self.autoResize;
         if (!profile.resizePreset) profile.resizePreset = presets.normalizeResizeName("", self.resizePresets);
         if (profile.resize === undefined) profile.resize = 1;
-        profile.resizeDirty = profile.resizeDirty === true;
+        profile.resizeDirty = false;
         if (profile.manualScale === undefined) profile.manualScale = 1;
         if (model && model.controls && model.controls.aspect_ratio && !controlHasOption(model, "aspect_ratio", profile.aspectRatio)) profile.aspectRatio = defaultAspect;
         else if (profile.aspectRatio === undefined) profile.aspectRatio = defaultAspect;
@@ -1843,7 +1846,6 @@ function Config() {
             autoResize: profile.autoResize !== false,
             resizePreset: String(profile.resizePreset || ""),
             resize: Number(profile.resize === undefined ? 1 : profile.resize),
-            resizeDirty: profile.resizeDirty === true,
             manualScale: Number(profile.manualScale === undefined ? 1 : profile.manualScale),
             aspectRatio: String(profile.aspectRatio || ""),
             quality: String(profile.quality || ""),
@@ -1934,7 +1936,7 @@ function Config() {
     };
     this.saveToAction = function (recordMode) {
         syncData();
-        playbackParameters = descriptorCodec.toDescriptor(actionData(recordMode));
+        app.playbackParameters = descriptorCodec.toDescriptor(actionData(recordMode));
     };
     this.save = function () {
         syncData();
@@ -2361,6 +2363,7 @@ function Locale() {
         errActionSettingsVersion: ["Настройки шага Action относятся к другой версии скрипта. Перезапишите шаг Action текущей версией.", "The Action step settings belong to another script version. Record the Action step again with the current version."],
         errActionProviderMissing: ["Провайдер «%1», записанный в шаге Action, отсутствует в текущих карточках. Перезапишите шаг Action с доступным провайдером и моделью.", "The provider “%1” stored in the Action step is absent from the current cards. Record the Action step again with an available provider and model."],
         errActionModelMissing: ["Модель «%1», записанная в шаге Action, отсутствует в текущих карточках. Перезапишите шаг Action с доступной моделью.", "The model “%1” stored in the Action step is absent from the current cards. Record the Action step again with an available model."],
+        errActionApiKeyMissing: ["API-ключ для провайдера «%1», записанного в шаге Action, не настроен. Настройте ключ или перезапишите шаг Action.", "The API key for provider “%1” stored in the Action step is not configured. Configure the key or record the Action step again."],
         jsxLine: ["Строка JSX: ", "JSX line: "]
     }, key;
     for (key in localized) if (localized.hasOwnProperty(key)) this[key] = { ru: localized[key][0], en: localized[key][1] };
