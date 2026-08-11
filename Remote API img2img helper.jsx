@@ -22,6 +22,7 @@ var APP = {
     uuid: "03c3cc32-600d-4e47-ad5c-2b11c0f5f176",
     settingsFile: "Remote API img2img helper.desc",
     tempFolder: "Remote API img2img helper",
+    startupFile: "state/startup.json",
     generatedLayerName: "generated image",
     dialogEnvKey: "remoteApiImg2imgHelperDialogMode",
     cancelToken: "__REMOTE_API_IMG2IMG_HELPER_CANCELLED__",
@@ -31,9 +32,9 @@ var APP = {
         property: "generationSettings"
     }
 },
-    VER = "0.123",
-    SETTINGS_DATA_VERSION = 1,
-    ACTION_DATA_VERSION = 3,
+    VER = "0.124",
+    SETTINGS_DATA_VERSION = 2,
+    ACTION_DATA_VERSION = 4,
     // Отладочный флаг должен оставаться false в рабочей сборке. При true
     // главное окно открывается всегда, независимо от сохранённого тихого режима.
     DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
@@ -41,13 +42,17 @@ var APP = {
     API_HOST = "127.0.0.1",
     API_PORT_SEND = 6380,
     API_PORT_LISTEN = 6381,
-    API_PROTOCOL = 1,
-    START_TIMEOUT = 30 * 60 * 1000,
+    API_PROTOCOL = 2,
+    // Локальный listener поднимается сразу; этот таймаут включает подготовку обязательных зависимостей.
+    START_TIMEOUT = 2 * 60 * 1000,
     SHORT_TIMEOUT = 8000,
     TRANSLATE_TIMEOUT = 10 * 60 * 1000,
+    GENERATION_PREPARE_EXPECTED_MS = 7500,
+    GENERATION_RUN_DEFAULT_EXPECTED_MS = 7500,
     GENERATION_PREPARE_SEGMENT = 20,
     GENERATION_RUN_SEGMENT = 80,
-    PROGRESS_TASK_RANGE = 40,
+    GENERATION_TOTAL_SEGMENTS = 100,
+    PROGRESS_STAGE_TARGET = 0.95,
     REFERENCE_IMAGE_FILTER = "JPEG/PNG/WebP:*.jpg;*.jpeg;*.png;*.webp",
     startupStartedAt = (new Date()).getTime(),
     s2t = stringIDToTypeID,
@@ -77,8 +82,6 @@ var APP = {
     skipSettingsSaveOnError = false,
     keyboardState = ScriptUI.environment.keyboardState;
 
-if (keyboardState.shiftKey && action.getPlaybackParameterCount() != 1) $.setenv(APP.dialogEnvKey, "true");
-if (action.hasInterfaceArgument()) $.setenv(APP.dialogEnvKey, "true");
 try { init(); }
 catch (e) {
     if (startupProgress) { try { startupProgress.close(); } catch (_) { } startupProgress = null; }
@@ -129,9 +132,9 @@ function init() {
     if (doc.getProperty("mode").value != "RGBColor") throw new Error(cardText(str.errMode));
 
     var playbackCount = action.getPlaybackParameterCount(),
-        forceDialog = action.hasInterfaceArgument(),
         settingsWarnings = [];
-    actionPlaybackMode = action.isPlayback(playbackCount);
+    actionPlaybackMode = action.isPlayback();
+    var forceDialog = keyboardState.shiftKey || (!actionPlaybackMode && action.hasInterfaceArgument());
     if (actionPlaybackMode) {
         // При playback сначала всегда загружается актуальный глобальный DESC.
         // Action не является отдельной конфигурацией скрипта: он может только
@@ -151,8 +154,9 @@ function init() {
     cfg.cleanReferenceHistory();
 
     var environmentMode = DEBUG_FIRST_LAUNCH_WITH_INTERFACE ? null : $.getenv(APP.dialogEnvKey),
-        showInterface = DEBUG_FIRST_LAUNCH_WITH_INTERFACE || forceDialog || environmentMode == "true" ||
-            (actionPlaybackMode ? app.playbackDisplayDialogs == DialogModes.ALL : environmentMode == null),
+        showInterface = DEBUG_FIRST_LAUNCH_WITH_INTERFACE || (actionPlaybackMode
+            ? forceDialog || app.playbackDisplayDialogs == DialogModes.ALL
+            : forceDialog || environmentMode == "true" || environmentMode == null),
         selection = { result: false, bounds: null, sourceBounds: null, previousGeneration: null, junk: null, flattenedSource: null };
 
     app.activeDocument.suspendHistory(localize(str.historyCheckSelection), "checkSelection(selection)");
@@ -309,6 +313,7 @@ function mainDialog(selection, initial, responseSeconds) {
         dynamicGroup = null,
         dynamic = {},
         activeModelId = "",
+        promptPresetUpdating = false,
         statusText = w.add("statictext", undefined, "", { multiline: true }),
         okRow = w.add("group{orientation:'row',alignChildren:['center','center'],spacing:10,margins:[0,8,0,0]}"),
         bOk = okRow.add("button", undefined, str.generate, { name: "ok" }),
@@ -379,9 +384,12 @@ function mainDialog(selection, initial, responseSeconds) {
         updateGenerateState(); updatePromptPresetState();
     };
     promptToolbar.dropdown.onChange = function () {
+        if (promptPresetUpdating) return;
+        var p = currentProfile();
+        if (p) p.selectedPromptPreset = selectedPromptPresetName();
         var presetText = selectedPromptPresetText();
         promptEdit.text = presets.applyPrompt('positive', promptEdit.text, presetText);
-        var p = currentProfile(); if (p) p.prompt = promptEdit.text;
+        if (p) p.prompt = promptEdit.text;
         updateGenerateState(); updatePromptPresetState();
     };
     promptToolbar.refresh.onClick = function () {
@@ -396,7 +404,9 @@ function mainDialog(selection, initial, responseSeconds) {
         if (String(name).toLowerCase() == String(cardText(str.presetDefault)).toLowerCase()) { alert(cardText(str.errDefaultPreset)); return; }
         if (promptPresetStore.hasOwnProperty(name) && !confirm(String(cardText(str.errPreset)).replace('%1', name), false, cardText(str.presetNew))) return;
         promptPresetStore[name] = presets.promptText('positive', promptEdit.text);
-        fillPromptPresets(name); updatePromptPresetState();
+        fillPromptPresets(name);
+        var p = currentProfile(); if (p) p.selectedPromptPreset = selectedPromptPresetName();
+        updatePromptPresetState();
     };
     promptToolbar.save.onClick = function () {
         if (!promptToolbar.dropdown.selection || promptToolbar.dropdown.selection.index == 0) return;
@@ -409,6 +419,7 @@ function mainDialog(selection, initial, responseSeconds) {
         if (!confirm(cardText(str.presetDeleteConfirmA) + name + cardText(str.presetDeleteConfirmB))) return;
         delete promptPresetStore[name];
         fillPromptPresets(null, Math.max(0, index - 1));
+        var p = currentProfile(); if (p) p.selectedPromptPreset = selectedPromptPresetName();
         updatePromptPresetState();
     };
     bSettings.onClick = function () {
@@ -435,7 +446,14 @@ function mainDialog(selection, initial, responseSeconds) {
             cfg.selectedProvider = cfg.data.selectedProvider = metadata.provider_id;
             cfg.selectedModel = cfg.data.selectedModel = metadata.model_id;
             var profile = cfg.getModelProfile(cfg.selectedModel, metadataModel);
-            if (isObjectMap(metadata.profile)) mergeObject(profile, metadata.profile);
+            if (isObjectMap(metadata.profile)) {
+                var metadataKeys = ["autoResize", "resizePreset", "manualScale", "selectedPromptPreset", "aspectRatio", "quality", "reference"];
+                for (var mk = 0; mk < metadataKeys.length; mk++) {
+                    var metadataKey = metadataKeys[mk];
+                    if (metadata.profile.hasOwnProperty(metadataKey)) profile[metadataKey] = cloneObj(metadata.profile[metadataKey]);
+                }
+                profile = cfg.getModelProfile(cfg.selectedModel, metadataModel);
+            }
             if (metadata.prompt !== undefined) profile.prompt = String(metadata.prompt || "");
             promptEdit.text = profile.prompt || "";
             fillPromptPresets(); updatePromptPresetState();
@@ -472,8 +490,14 @@ function mainDialog(selection, initial, responseSeconds) {
     ui.enableHoverFocus(w);
     w.center(); w.show(); return result;
 
+    function selectedPromptPresetName() {
+        return promptToolbar.dropdown.selection && promptToolbar.dropdown.selection.index > 0
+            ? String(promptToolbar.dropdown.selection.text)
+            : "";
+    }
     function selectedPromptPresetText() {
-        return promptToolbar.dropdown.selection && promptToolbar.dropdown.selection.index > 0 ? String(promptPresetStore[promptToolbar.dropdown.selection.text] || '') : '';
+        var name = selectedPromptPresetName();
+        return name ? String(promptPresetStore[name] || '') : '';
     }
     function updatePromptPresetState() {
         var cur = presets.promptText('positive', promptEdit.text),
@@ -487,17 +511,20 @@ function mainDialog(selection, initial, responseSeconds) {
         translateButton.enabled = cur.length > 0;
     }
     function fillPromptPresets(selectName, selectIndex) {
-        promptToolbar.dropdown.removeAll();
-        promptToolbar.dropdown.add('item', cardText(str.presetDefault));
-        var names = [], key, i, sel = 0;
-        for (key in promptPresetStore) if (promptPresetStore.hasOwnProperty(key)) names.push(key);
-        names.sort(function (a, b) { a = String(a).toLowerCase(); b = String(b).toLowerCase(); return a == b ? 0 : (a > b ? 1 : -1); });
-        for (i = 0; i < names.length; i++) {
-            promptToolbar.dropdown.add('item', names[i]);
-            if (names[i] == selectName) sel = i + 1;
-        }
-        if (selectName == null && selectIndex != null) sel = Math.min(Math.max(0, selectIndex), promptToolbar.dropdown.items.length - 1);
-        promptToolbar.dropdown.selection = sel;
+        promptPresetUpdating = true;
+        try {
+            promptToolbar.dropdown.removeAll();
+            promptToolbar.dropdown.add('item', cardText(str.presetDefault));
+            var names = [], key, i, sel = 0;
+            for (key in promptPresetStore) if (promptPresetStore.hasOwnProperty(key)) names.push(key);
+            names.sort(function (a, b) { a = String(a).toLowerCase(); b = String(b).toLowerCase(); return a == b ? 0 : (a > b ? 1 : -1); });
+            for (i = 0; i < names.length; i++) {
+                promptToolbar.dropdown.add('item', names[i]);
+                if (names[i] == selectName) sel = i + 1;
+            }
+            if (selectName == null && selectIndex != null) sel = Math.min(Math.max(0, selectIndex), promptToolbar.dropdown.items.length - 1);
+            promptToolbar.dropdown.selection = sel;
+        } finally { promptPresetUpdating = false; }
     }
     function updateSelectionSummary() {
         var b = selection.bounds;
@@ -541,6 +568,7 @@ function mainDialog(selection, initial, responseSeconds) {
         if (profile) {
             profile.comment = String(commentEdit.text || "");
             profile.prompt = promptEdit.text;
+            profile.selectedPromptPreset = selectedPromptPresetName();
         }
         if (profile && dynamic.aspectRatio) profile.aspectRatio = dynamic.aspectRatio.getValue();
         if (profile && dynamic.quality) profile.quality = dynamic.quality.getValue();
@@ -562,6 +590,9 @@ function mainDialog(selection, initial, responseSeconds) {
         var profile = cfg.getModelProfile(model.id, model);
         commentEdit.text = profile.comment || "";
         promptEdit.text = profile.prompt || "";
+        if (profile.selectedPromptPreset && !promptPresetStore.hasOwnProperty(profile.selectedPromptPreset))
+            profile.selectedPromptPreset = "";
+        fillPromptPresets(profile.selectedPromptPreset || "");
         ui.addResizeControl(dynamicGroup, selection.bounds, profile, model);
         var controls = model.controls || {};
         if (controls.aspect_ratio) dynamic.aspectRatio = ui.addOptionControl(dynamicGroup, controls.aspect_ratio, profile.aspectRatio);
@@ -634,9 +665,13 @@ function showGlobalSettings(catalog) {
     ui.setFixedWidth(timeoutRow, ui.settingsControlWidth);
     timeoutLabel.alignment = ['fill', 'center'];
     ui.setFixedWidth(timeoutEdit, 70);
-    function syncOpacityValue() { opacityControl.valueText.text = String(Math.round(opacityControl.slider.value)); }
-    opacityControl.slider.onChanging = syncOpacityValue;
-    opacityControl.slider.onChange = syncOpacityValue;
+    var opacityStepper = createSliderStepper(opacityControl.slider, 1, 1);
+    function syncOpacityValue(finalize) {
+        var value = finalize ? opacityStepper.finish() : opacityStepper.sync(false);
+        opacityControl.valueText.text = String(Math.round(value));
+    }
+    opacityControl.slider.onChanging = function () { syncOpacityValue(false); };
+    opacityControl.slider.onChange = function () { syncOpacityValue(true); };
 
     save.onClick = function () {
         try {
@@ -747,22 +782,29 @@ function showGlobalSettings(catalog) {
             titleGroup = group.add("group{orientation:'row',alignChildren:['left','center'],spacing:5,margins:0}");
         ui.setFixedWidth(group, ui.settingsControlWidth);
         ui.setFixedWidth(titleGroup, ui.settingsControlWidth);
-        var label = titleGroup.add('statictext'), valueText = titleGroup.add('statictext{justify:"right"}'), slider = group.add('slider'), control = { slider: slider, value: valueText, suffix: options.suffix, step: options.step, decimal: options.suffix == ' MP', snappedValue: null, pointerActive: false };
+        var label = titleGroup.add('statictext'), valueText = titleGroup.add('statictext{justify:"right"}'), slider = group.add('slider'),
+            control = { slider: slider, value: valueText, suffix: options.suffix, step: options.step, decimal: options.suffix == ' MP' };
         label.text = cardText(options.title); label.alignment = ['fill', 'center']; valueText.alignment = ['right', 'center'];
         ui.setFixedWidth(valueText, ui.sliderValueWidth);
         ui.setFixedWidth(slider, ui.settingsControlWidth);
         slider.minvalue = options.min; slider.maxvalue = options.max; slider.value = options.value;
-        try { slider.addEventListener('mousedown', function () { control.pointerActive = true; }); } catch (_) { }
-        function syncValue(reset) { syncPresetSlider(control, !!reset, !control.pointerActive); }
-        slider.onChanging = function () { syncValue(false); };
-        slider.onChange = function () { syncValue(false); control.pointerActive = false; };
-        control.syncValue = syncValue; syncValue(true); return control;
-    }
-    function syncPresetSlider(control, reset, forceStep) {
-        var raw = Number(control.slider.value), previous = reset ? null : control.snappedValue, value = Math.round(raw / control.step) * control.step;
-        if (forceStep && previous !== null && value == previous && raw != previous) value = previous + (raw > previous ? control.step : -control.step);
-        value = clamp(value, control.slider.minvalue, control.slider.maxvalue);
-        control.slider.value = value; control.snappedValue = value; control.value.text = (control.decimal ? value / 100 : value) + control.suffix;
+        control.stepper = createSliderStepper(slider, options.step, options.min);
+        try { ui.enableHoverFocus(slider); } catch (_) { }
+        function render(value) {
+            slider.value = value;
+            control.value.text = (control.decimal ? value / 100 : value) + control.suffix;
+            return value;
+        }
+        function syncValue(reset, finalize) {
+            var value = reset ? control.stepper.reset(slider.value)
+                : (finalize ? control.stepper.finish() : control.stepper.sync(false));
+            return render(value);
+        }
+        slider.onChanging = function () { syncValue(false, false); };
+        slider.onChange = function () { syncValue(false, true); };
+        control.syncValue = function (reset) { return syncValue(!!reset, false); };
+        syncValue(true, false);
+        return control;
     }
     function addCredentialRow(provider) {
         var row = credentialsPanel.add("group{orientation:'row',alignChildren:['left','center'],spacing:6,margins:0}"),
@@ -936,6 +978,7 @@ function UI() {
         slider.value = value;
         title.text = cardText(labelText);
         valueText.text = options.displayValue !== undefined ? options.displayValue : value;
+        try { self.enableHoverFocus(slider); } catch (_) { }
         return { group: group, titleGroup: titleGroup, title: title, valueText: valueText, slider: slider };
     };
     this.addOptionControl = function (parent, definition, storedId) {
@@ -1002,8 +1045,6 @@ function UI() {
     this.addResizeControl = function (parent, bounds, profile, model) {
         if (profile.autoResize === undefined) profile.autoResize = cfg.autoResize;
         if (profile.manualScale === undefined) profile.manualScale = 1;
-        if (profile.resize === undefined) profile.resize = 1;
-        profile.resizeDirty = false;
         if (!profile.resizePreset) profile.resizePreset = presets.normalizeResizeName("", cfg.resizePresets);
         var multiple = model && model.input ? clamp(parseInt(model.input.dimension_multiple, 10) || 1, 1, 256) : 1,
             group = parent.add("group{orientation:'column',alignChildren:['fill','top'],spacing:0,margins:0}"),
@@ -1012,18 +1053,22 @@ function UI() {
             title = titleRow.add("statictext"),
             valueText = titleRow.add("statictext{justify:'right'}"),
             slider = group.add("slider{minvalue:1,maxvalue:800}"),
-            presetList = group.add("dropdownlist");
+            presetList = group.add("dropdownlist"),
+            resizeStepper = createSliderStepper(slider, 1, 1);
         self.setFixedWidth(group, self.contentWidth()); self.setFixedWidth(titleRow, self.contentWidth()); self.setFixedWidth(slider, self.contentWidth()); self.setFixedWidth(presetList, self.contentWidth());
         checkbox.preferredSize.width = self.autoResizeCheckboxWidth;
         title.preferredSize.width = self.contentWidth() - self.autoResizeCheckboxWidth - self.sliderValueWidth;
         valueText.preferredSize.width = self.sliderValueWidth;
         checkbox.value = !!profile.autoResize; checkbox.helpTip = str.autoResize;
+        try { self.enableHoverFocus(slider); } catch (_) { }
         for (var i = 0; i < cfg.resizePresets.length; i++) presetList.add("item", presets.formatResize(cfg.resizePresets[i]));
         var presetIndex = presets.findResizeIndex(profile.resizePreset, cfg.resizePresets);
         presetList.selection = Math.max(0, presetIndex);
         profile.resizePreset = presets.findResize(profile.resizePreset, cfg.resizePresets).name;
         function currentScale() {
-            return profile.autoResize ? profile.resize : profile.manualScale;
+            return profile.autoResize
+                ? autoScale(bounds, presets.findResize(profile.resizePreset, cfg.resizePresets))
+                : profile.manualScale;
         }
         function sizeText() {
             var scale = currentScale(),
@@ -1033,44 +1078,41 @@ function UI() {
             return scale != 1 ? text + ": " + size.width + "x" + size.height + " (" + mp + " MP)" : text;
         }
         function setSlider() {
-            if (profile.autoResize) {
-                profile.resize = autoScale(bounds, presets.findResize(profile.resizePreset, cfg.resizePresets));
-                slider.value = profile.resize * 100;
-                valueText.text = profile.resize.toFixed(2);
-            } else {
-                slider.value = profile.manualScale * 100;
-                profile.manualScale = Math.floor(slider.value) / 100;
-                valueText.text = profile.manualScale.toFixed(2);
-            }
+            var scale = currentScale();
+            resizeStepper.reset(scale * 100);
+            if (!profile.autoResize) profile.manualScale = Math.round(slider.value) / 100;
+            valueText.text = currentScale().toFixed(2);
             title.text = sizeText();
             presetList.enabled = profile.autoResize;
             checkbox.value = !!profile.autoResize;
         }
-        function sync() {
-            var v = Math.floor(slider.value), scale = (v >= 97 && v <= 103) ? 1 : Math.max(0.01, v / 100);
+        function sync(finalize) {
+            var pointerActive = resizeStepper.pointerActive,
+                sliderValue = finalize ? resizeStepper.finish() : resizeStepper.sync(false);
+            // Магнит к 100% действует только при drag; клавиши/колесо идут строго по 0.01.
+            if (pointerActive && sliderValue >= 97 && sliderValue <= 103) {
+                sliderValue = 100;
+                resizeStepper.reset(100);
+            }
+            var scale = Math.max(0.01, Math.round(sliderValue) / 100);
             if (profile.autoResize) {
                 profile.autoResize = false;
-                profile.manualScale = scale;
-                profile.resize = scale;
                 checkbox.value = false;
                 presetList.enabled = false;
-            } else {
-                profile.manualScale = scale;
             }
-            profile.resizeDirty = false;
-            valueText.text = currentScale().toFixed(2);
+            profile.manualScale = scale;
+            valueText.text = scale.toFixed(2);
             title.text = sizeText();
         }
-        slider.onChanging = slider.onChange = sync;
+        slider.onChanging = function () { sync(false); };
+        slider.onChange = function () { sync(true); };
         checkbox.onClick = function () {
             profile.autoResize = this.value;
-            profile.resizeDirty = false;
             setSlider();
         };
         presetList.onChange = function () {
             if (!this.selection) return;
             profile.resizePreset = cfg.resizePresets[this.selection.index].name;
-            profile.resizeDirty = false;
             setSlider();
         };
         setSlider();
@@ -1083,7 +1125,7 @@ function UI() {
     };
     function StartupProgress(msg, timeout) {
         var w = new Window("palette", APP.name), text = w.add("statictext"), bar = w.add("progressbar", undefined, 0, 100),
-            currentMessage = msg, baseValue = 2, started = (new Date()).getTime(), stageStarted = started,
+            currentMessage = msg, baseValue = 2, stageStarted = (new Date()).getTime(),
             totalTimeout = Math.max(1000, timeout || START_TIMEOUT);
         w.orientation = "column"; w.alignChildren = ["fill", "top"]; w.spacing = 5; w.margins = 15;
         text.preferredSize = [420, -1]; bar.preferredSize = [420, 15]; text.text = currentMessage; bar.value = baseValue;
@@ -1159,8 +1201,8 @@ function GenerationRuntime() {
                 profile: {
                     autoResize: profile.autoResize,
                     resizePreset: profile.resizePreset,
-                    resize: profile.resize,
                     manualScale: profile.manualScale,
+                    selectedPromptPreset: profile.selectedPromptPreset || "",
                     aspectRatio: profile.aspectRatio,
                     quality: profile.quality,
                     reference: profile.reference || ""
@@ -1345,25 +1387,31 @@ function GenerationRuntime() {
 }
 
 function GenerationProgress() {
-    var payload = null, res = null, firstAnswer = null, prepareTitle = "", generateTitle = "", delayKey = "", delayMax = 7500, requestId = null;
+    var payload = null, res = null, firstAnswer = null, prepareTitle = "", generateTitle = "", delayKey = "", delayMax = GENERATION_RUN_DEFAULT_EXPECTED_MS, requestId = null;
     this.begin = function (options) {
         options = options || {}; payload = options.command || null; res = null; firstAnswer = null;
         prepareTitle = options.titles && options.titles.prepare ? options.titles.prepare : "";
         generateTitle = options.titles && options.titles.generate ? options.titles.generate : "";
-        delayKey = options.timingKey || ""; delayMax = options.timingMax || 7500; requestId = options.requestId || (payload ? payload.request_id : null);
+        delayKey = options.timingKey || ""; delayMax = options.timingMax || GENERATION_RUN_DEFAULT_EXPECTED_MS; requestId = options.requestId || (payload ? payload.request_id : null);
     };
     this.run = function () {
-        if (!app.doProgressSegmentTask(GENERATION_PREPARE_SEGMENT, 0, 100, "generationStageOne()")) {
+        if (!app.doProgressSegmentTask(GENERATION_PREPARE_SEGMENT, 0, GENERATION_TOTAL_SEGMENTS, "generationStageOne()")) {
             $.setenv(APP.dialogEnvKey, "true"); api.interrupt(requestId); throw new Error(APP.cancelToken);
         }
         if (!firstAnswer || firstAnswer.type == "error" || firstAnswer.message != "init") { res = firstAnswer; return true; }
-        if (!app.doProgressSegmentTask(GENERATION_RUN_SEGMENT, GENERATION_PREPARE_SEGMENT, 100, "generationStageTwo()")) {
+        if (!app.doProgressSegmentTask(GENERATION_RUN_SEGMENT, GENERATION_PREPARE_SEGMENT, GENERATION_TOTAL_SEGMENTS, "generationStageTwo()")) {
             $.setenv(APP.dialogEnvKey, "true"); api.interrupt(requestId); throw new Error(APP.cancelToken);
         }
         return true;
     };
     this.stageOne = function () {
-        var answer = api.startGeneration({ command: payload, timeout: 120000, title: prepareTitle || str.progressPrepare });
+        var answer = api.startGeneration({
+            command: payload,
+            timeout: 120000,
+            title: prepareTitle || str.progressPrepare,
+            max: GENERATION_PREPARE_EXPECTED_MS,
+            progressCurve: "hyperbolic"
+        });
         if (answer === false) return false; firstAnswer = answer; return true;
     };
     this.stageTwo = function () {
@@ -1372,7 +1420,7 @@ function GenerationProgress() {
     };
     this.getResult = function () { return res; };
     this.getRequestId = function () { return requestId; };
-    this.clear = function () { payload = null; res = null; firstAnswer = null; prepareTitle = ""; generateTitle = ""; delayKey = ""; delayMax = 7500; requestId = null; };
+    this.clear = function () { payload = null; res = null; firstAnswer = null; prepareTitle = ""; generateTitle = ""; delayKey = ""; delayMax = GENERATION_RUN_DEFAULT_EXPECTED_MS; requestId = null; };
 }
 function prepareSelectionLayer(selection) { return generation.prepareSelectionLayer(selection); }
 function checkSelection(res) { return generation.checkSelection(res); }
@@ -1433,36 +1481,45 @@ function BridgeApi() {
     var self = this;
     this.isRunning = function () { return checkConnection(API_HOST, API_PORT_SEND); };
     this.initialize = function (progress, knownRunning) {
-        // init() уже делает TCP-check, чтобы решить, показывать ли progress. Не
-        // повторяем его на обычном тёплом запуске и не ищем Python-файл, пока
-        // действительно не понадобится запуск нового процесса.
-        var running = knownRunning === undefined ? self.isRunning() : !!knownRunning,
+        var deadline = (new Date()).getTime() + START_TIMEOUT,
+            running = knownRunning === undefined ? self.isRunning() : !!knownRunning,
             runningInfo = null;
         if (running) {
             try { runningInfo = self.ping(progress); }
             catch (pingError) {
-                // Редкая гонка: процесс мог завершиться между TCP-check и ping.
-                // Дополнительный check выполняется только после ошибки.
                 if (self.isRunning()) throw pingError;
                 running = false;
             }
             if (running) {
-                if (String(runningInfo.protocol) != String(API_PROTOCOL)) throw new Error(cardText(str.errApiProtocolA) + runningInfo.protocol + cardText(str.errApiProtocolB) + API_PROTOCOL + ".");
+                validatePythonProtocol(runningInfo);
+                waitForPythonReady(runningInfo, progress, deadline);
                 return true;
             }
         }
         var pythonFile = findPythonModule();
         if (!pythonFile) throw new Error(cardText(str.errPythonMissingA) + API_FILE + cardText(str.errPythonMissingB));
         if (progress) progress.setStage(str.progressStartPython, 3);
-        pythonFile.execute();
-        if (!waitForConnection(START_TIMEOUT, progress)) throw new Error(cardText(str.errPythonStartA) + API_HOST + ":" + API_PORT_SEND + cardText(str.errPythonStartB));
+        clearStartupStatus();
+        var launchStartedAt = (new Date()).getTime();
+        if (pythonFile.execute() === false) throw new Error(cardText(str.errPythonExecute) + "\n" + pythonFile.fsName);
+        var startupState = waitForConnection(Math.max(1, deadline - (new Date()).getTime()), progress, launchStartedAt);
+        if (startupState !== true) {
+            var logPath = startupState && startupState.log_file ? String(startupState.log_file) : startupLogPath();
+            if (startupState && startupState.status == "installing")
+                throw new Error(cardText(str.errPythonInstallTimeout) +
+                    (startupState.message ? "\n\n" + startupState.message : "") +
+                    (logPath ? "\n\n" + cardText(str.pythonLog) + logPath : ""));
+            throw new Error(cardText(str.errPythonStartA) + API_HOST + ":" + API_PORT_SEND + cardText(str.errPythonStartB) +
+                (logPath ? "\n\n" + cardText(str.pythonLog) + logPath : ""));
+        }
         var started = self.ping(progress);
-        if (String(started.protocol) != String(API_PROTOCOL)) throw new Error(cardText(str.errApiProtocolA) + started.protocol + cardText(str.errApiProtocolB) + API_PROTOCOL + ".");
+        validatePythonProtocol(started);
+        waitForPythonReady(started, progress, deadline);
         return true;
     };
     this.ping = function (progress, timeout) { return call("ping", null, timeout || SHORT_TIMEOUT, progress); };
     this.translate = function (text, progress) { return call("translate", { text: text || "" }, TRANSLATE_TIMEOUT, progress); };
-    this.handshake = function (progress) { return call("handshake", { generationTimeout: cfg.generationTimeout }, SHORT_TIMEOUT, progress); };
+    this.handshake = function (progress) { return call("handshake", {}, SHORT_TIMEOUT, progress); };
     this.encryptCredential = function (providerId, secret) { return call("credential_encrypt", { provider_id: providerId, secret: secret || "" }, SHORT_TIMEOUT); };
     this.interrupt = function (requestId) {
         try { fire(makeCommand("interrupt", { request_id: requestId || "" }, requestId)); } catch (_) { }
@@ -1472,7 +1529,8 @@ function BridgeApi() {
         return requestWithOptions(options.command, {
             timeout: options.timeout,
             title: options.title,
-            max: options.timeout,
+            max: options.max,
+            progressCurve: options.progressCurve,
             interruptOnTimeout: true
         });
     };
@@ -1529,6 +1587,7 @@ function BridgeApi() {
             title = options.title,
             progress = options.progress,
             max = options.max,
+            progressCurve = options.progressCurve || "exponential",
             trackDelay = !!options.trackDelay,
             delayKey = options.delayKey,
             expectedRequestId = options.expectedRequestId,
@@ -1538,9 +1597,8 @@ function BridgeApi() {
             t3 = t1,
             slice = 0;
         if (title) {
-            max = Number(max) || timeout || 7500;
+            max = Number(max) || timeout || GENERATION_RUN_DEFAULT_EXPECTED_MS;
             if (max < 1) max = 1;
-            slice = 1 / max * PROGRESS_TASK_RANGE;
         }
         for (; ;) {
             t2 = (new Date()).getTime();
@@ -1553,6 +1611,12 @@ function BridgeApi() {
             }
             if (progress) progress.pulse();
             if (title && t2 - t3 >= 1) {
+                var progressDelta = t2 - t3;
+                if (progressDelta > 0 && progressCurve == "hyperbolic")
+                    slice = progressDelta / (max + t2 - t1);
+                else slice = progressDelta > 0
+                    ? 1 - Math.pow(1 - PROGRESS_STAGE_TARGET, progressDelta / max)
+                    : 0;
                 t3 = t2;
                 var text = trackDelay
                     ? title + "\t " + Math.floor((t2 - t1) / 100) / 10 + " s. "
@@ -1617,14 +1681,121 @@ function BridgeApi() {
         for (var i = 0; i < candidates.length; i++) if (candidates[i].exists) return candidates[i];
         return null;
     }
-    function waitForConnection(timeout, startup) {
-        var started = (new Date()).getTime();
+    function waitForConnection(timeout, progress, launchStartedAt) {
+        var started = (new Date()).getTime(), lastStatus = null, lastStage = "";
         while ((new Date()).getTime() - started < timeout) {
-            if (checkConnection(API_HOST, API_PORT_SEND)) return true;
-            if (startup) startup.pulse();
+            if (checkConnection(API_HOST, API_PORT_SEND)) {
+                clearStartupStatus();
+                return true;
+            }
+            var status = consumeStartupStatus(launchStartedAt);
+            if (status) {
+                lastStatus = status;
+                if (status.status == "error")
+                    throw new Error(cardText(str.errPythonStartupDetails) +
+                        (status.message ? "\n\n" + status.message : "") +
+                        (status.log_file ? "\n\n" + cardText(str.pythonLog) + status.log_file : ""));
+                var stage = status.status == "installing"
+                    ? cardText(str.progressInstallPython) + (status.message ? " " + status.message : "")
+                    : cardText(str.progressStartPython);
+                if (progress && stage != lastStage) { progress.setStage(stage, 3); lastStage = stage; }
+            }
+            if (progress) progress.pulse();
             $.sleep(25);
         }
-        return false;
+        clearStartupStatus();
+        return lastStatus || false;
+    }
+    function validatePythonProtocol(info) {
+        if (String(info && info.protocol) != String(API_PROTOCOL))
+            throw new Error(cardText(str.errApiProtocolA) + (info ? info.protocol : "") +
+                cardText(str.errApiProtocolB) + API_PROTOCOL + ".");
+    }
+    function ensureStartupProgress(progress) {
+        if (progress) return progress;
+        startupProgress = ui.createStartupProgress(str.progressStartPython, START_TIMEOUT);
+        startupProgress.show();
+        return startupProgress;
+    }
+    function waitForPythonReady(info, progress, deadline) {
+        var lastStage = "";
+        for (;;) {
+            validatePythonProtocol(info);
+            clearStartupStatus();
+            var status = String(info.startup_status || "ready").toLowerCase(),
+                message = String(info.startup_message || ""),
+                logPath = String(info.startup_log_file || startupLogPath() || "");
+            if (status == "ready") return progress;
+            if (status == "error")
+                throw new Error(cardText(str.errPythonStartupDetails) +
+                    (message ? "\n\n" + message : "") +
+                    (logPath ? "\n\n" + cardText(str.pythonLog) + logPath : ""));
+            progress = ensureStartupProgress(progress);
+            var stage = status == "installing"
+                ? cardText(str.progressInstallPython) + (message ? " " + message : "")
+                : cardText(str.progressStartPython);
+            if (stage != lastStage) { progress.setStage(stage, 3); lastStage = stage; }
+            if ((new Date()).getTime() >= deadline) {
+                if (status == "installing")
+                    throw new Error(cardText(str.errPythonInstallTimeout) +
+                        (message ? "\n\n" + message : "") +
+                        (logPath ? "\n\n" + cardText(str.pythonLog) + logPath : ""));
+                throw new Error(cardText(str.errPythonStartA) + API_HOST + ":" + API_PORT_SEND + cardText(str.errPythonStartB) +
+                    (logPath ? "\n\n" + cardText(str.pythonLog) + logPath : ""));
+            }
+            progress.pulse();
+            $.sleep(500);
+            info = self.ping(progress, Math.min(SHORT_TIMEOUT, Math.max(1, deadline - (new Date()).getTime())));
+        }
+    }
+    function startupStatusFile() {
+        var root = "";
+        try { root = String($.getenv("LOCALAPPDATA") || ""); } catch (_) { }
+        return root ? new File(root + "/" + APP.tempFolder + "/" + APP.startupFile) : null;
+    }
+    function startupLogPath() {
+        var statusFile = startupStatusFile();
+        return statusFile ? statusFile.parent.parent.fsName + "/remote-api-img2img.log" : "";
+    }
+    function readUtf8File(file) {
+        if (!file || !file.exists) return null;
+        var opened = false;
+        try {
+            file.encoding = "UTF-8";
+            if (!file.open("r")) return null;
+            opened = true;
+            var value = file.read();
+            file.close(); opened = false;
+            return value;
+        } catch (_) { return null; }
+        finally { if (opened) try { file.close(); } catch (_) { } }
+    }
+    function clearStartupStatus() { discardStartupStatusFile(startupStatusFile()); }
+    function discardStartupStatusFile(file) {
+        if (!file || !file.exists) return;
+        try { if (file.remove()) return; } catch (_) { }
+        var opened = false;
+        try {
+            file.encoding = "UTF-8";
+            if (!file.open("w")) return;
+            opened = true;
+            file.write("");
+            file.close(); opened = false;
+        } catch (_) { }
+        finally { if (opened) try { file.close(); } catch (_) { } }
+    }
+    function consumeStartupStatus(launchStartedAt) {
+        var file = startupStatusFile(), source = readUtf8File(file);
+        if (source === null) return null;
+        var status = null;
+        try { status = jsonParse(source); } catch (_) { status = null; }
+        var current = readUtf8File(file);
+        if (current === source) discardStartupStatusFile(file);
+        if (!status || typeof status != "object") return null;
+        var startedAt = Number(status.started_at || 0) * 1000;
+        if (launchStartedAt && startedAt && startedAt < launchStartedAt - 5000) return null;
+        status.status = String(status.status || "").toLowerCase();
+        return status;
     }
     function checkConnection(host, port) {
         var socket = new Socket();
@@ -1769,9 +1940,9 @@ function Config() {
         if (!isObjectMap(profile)) profile = self.modelProfiles[key] = {
             comment: "",
             prompt: "",
+            selectedPromptPreset: "",
             autoResize: self.autoResize,
             resizePreset: presets.normalizeResizeName("", self.resizePresets),
-            resize: 1,
             manualScale: 1,
             aspectRatio: defaultAspect,
             quality: defaultQuality,
@@ -1779,10 +1950,9 @@ function Config() {
         };
         profile.comment = profile.comment === undefined || profile.comment === null ? "" : String(profile.comment);
         profile.prompt = profile.prompt === undefined || profile.prompt === null ? "" : String(profile.prompt);
+        profile.selectedPromptPreset = profile.selectedPromptPreset === undefined || profile.selectedPromptPreset === null ? "" : String(profile.selectedPromptPreset);
         if (profile.autoResize === undefined) profile.autoResize = self.autoResize;
         if (!profile.resizePreset) profile.resizePreset = presets.normalizeResizeName("", self.resizePresets);
-        if (profile.resize === undefined) profile.resize = 1;
-        profile.resizeDirty = false;
         if (profile.manualScale === undefined) profile.manualScale = 1;
         if (model && model.controls && model.controls.aspect_ratio && !controlHasOption(model, "aspect_ratio", profile.aspectRatio)) profile.aspectRatio = defaultAspect;
         else if (profile.aspectRatio === undefined) profile.aspectRatio = defaultAspect;
@@ -1843,9 +2013,9 @@ function Config() {
         profile = isObjectMap(profile) ? profile : {};
         return {
             prompt: profile.prompt === undefined || profile.prompt === null ? "" : String(profile.prompt),
+            selectedPromptPreset: String(profile.selectedPromptPreset || ""),
             autoResize: profile.autoResize !== false,
             resizePreset: String(profile.resizePreset || ""),
-            resize: Number(profile.resize === undefined ? 1 : profile.resize),
             manualScale: Number(profile.manualScale === undefined ? 1 : profile.manualScale),
             aspectRatio: String(profile.aspectRatio || ""),
             quality: String(profile.quality || ""),
@@ -1996,9 +2166,11 @@ function ActionRuntime() {
         cfg.copyGlobalDataTo(globalSettings); globalSettings.save();
     }
     this.getPlaybackParameterCount = function () { try { return app.playbackParameters ? app.playbackParameters.count : 0; } catch (_) { return 0; } };
-    this.isPlayback = function (parameterCount) {
-        try { var desc = app.playbackParameters, marker = s2t("actionDataVersion"); if (desc && desc.hasKey(marker)) return true; } catch (_) { }
-        return Number(parameterCount) > 1;
+    this.isPlayback = function () {
+        try {
+            var desc = app.playbackParameters, marker = s2t("actionDataVersion");
+            return !!(desc && desc.hasKey(marker));
+        } catch (_) { return false; }
     };
     this.hasInterfaceArgument = function () {
         var values = []; try { if ($.arguments && $.arguments.length) for (var i = 0; i < $.arguments.length; i++) values.push($.arguments[i]); } catch (_) { }
@@ -2006,8 +2178,10 @@ function ActionRuntime() {
         return false;
     };
     this.getRecordedSettingsMode = function () {
-        try { var desc = app.playbackParameters, key = s2t("recordSettingsToAction"); if (desc && desc.hasKey(key) && desc.getType(key) == DescValueType.BOOLEANTYPE) return desc.getBoolean(key); } catch (_) { }
-        return true;
+        try {
+            var desc = app.playbackParameters, key = s2t("recordSettingsToAction");
+            return !!(desc && desc.hasKey(key) && desc.getType(key) == DescValueType.BOOLEANTYPE && desc.getBoolean(key));
+        } catch (_) { return false; }
     };
     this.saveAcceptedSettings = function () {
         if (actionPlaybackMode) {
@@ -2326,7 +2500,7 @@ function Locale() {
         keyConfigured: ["ключ настроен", "key configured"], keyMissing: ["ключ не настроен", "key not set"], setKey: ["Указать", "Set"], changeKey: ["Изменить", "Change"], deleteKey: ["Удалить", "Delete"],
         apiKey: ["API-ключ", "API key"], apiKeyNote: ["Ключ будет зашифрован средствами Windows DPAPI и сохранён в настройках Photoshop.", "The key will be encrypted with Windows DPAPI and stored in Photoshop settings."],
         loadLayerMetadata: ["Загрузить настройки из активного слоя", "Load settings from the active layer"],
-        progressStartPython: ["Запуск локального Python API…", "Starting local Python API…"], progressHandshake: ["Загрузка карточек моделей…", "Loading model cards…"],
+        progressStartPython: ["Запуск локального Python API…", "Starting local Python API…"], progressInstallPython: ["Установка зависимости Python:", "Installing Python dependency:"], progressHandshake: ["Загрузка карточек моделей…", "Loading model cards…"],
         progressReady: ["Готово", "Ready"], progressInitializing: ["Инициализация…", "Initializing…"], progressTranslate: ["Перевод промпта…", "Translating prompt…"],
         errTranslate: ["Переводчик не вернул результат.", "The translator returned no result."], progressPrepare: ["Подготовка запроса", "Preparing request"],
         progressGenerate: ["Ожидание API", "Waiting for API"], generationProgressTitle: ["Редактирование изображения", "Image editing"], secondsShort: ["с", "s"],
@@ -2352,6 +2526,10 @@ function Locale() {
         errSelectionTooSmall: ["Выделение слишком маленькое. Минимальный размер:", "The selection is too small. Minimum size:"],
         errPythonMissingA: ["Не найден ", "Could not find "], errPythonMissingB: [".pyw или .py рядом с JSX либо в подпапке lib.", ".pyw or .py next to JSX or in the lib subfolder."],
         errPythonStartA: ["Не удалось запустить Python API на ", "Could not start Python API at "], errPythonStartB: [".", "."],
+        errPythonExecute: ["Photoshop не смог запустить файл Python API.", "Photoshop could not launch the Python API file."],
+        errPythonStartupDetails: ["Критическая ошибка запуска Python API.", "Critical Python API startup error."],
+        errPythonInstallTimeout: ["Превышено время ожидания установки зависимости Python.", "Timed out while installing a Python dependency."],
+        pythonLog: ["Лог: ", "Log: "],
         errApiProtocolA: ["Версия локального API ", "Local API version "], errApiProtocolB: [" несовместима; требуется ", " is incompatible; expected "],
         errListenerPort: ["Не удалось открыть порт ответов ", "Could not open reply port "], errApiConnection: ["Не удалось подключиться к локальному Python API.", "Could not connect to the local Python API."],
         errApiTimeout: ["Истекло время ожидания ответа API.", "Timed out waiting for the API response."], errApiInvalidAnswer: ["Локальный API вернул некорректный JSON:", "Local API returned invalid JSON:"],
@@ -2448,9 +2626,31 @@ function settingsKey(value) {
 }
 function clamp(value, min, max) { return Math.max(min, Math.min(max, value)); }
 function roundTo(value, digits) { var k = Math.pow(10, digits || 0); return Math.round(value * k) / k; }
+// Единая дискретизация ScriptUI Slider: drag привязывается к step,
+// клавиша/колесо вне drag всегда дают ровно один логический шаг.
+function createSliderStepper(slider, step, origin) {
+    step = Math.abs(Number(step));
+    if (!isFinite(step) || step <= 0) step = 1;
+    origin = Number(origin);
+    if (!isFinite(origin)) origin = Number(slider.minvalue) || 0;
+    var state = { slider: slider, step: step, origin: origin, snappedValue: null, pointerActive: false };
+    try { slider.addEventListener("mousedown", function () { state.pointerActive = true; }); } catch (_) { }
+    state.sync = function (reset) {
+        var raw = Number(slider.value), previous = reset ? null : state.snappedValue, value;
+        if (!state.pointerActive && previous !== null && raw != previous)
+            value = roundByStep(previous + (raw > previous ? step : -step), step, origin);
+        else value = roundByStep(raw, step, origin);
+        value = clamp(value, Number(slider.minvalue), Number(slider.maxvalue));
+        slider.value = value; state.snappedValue = value; return value;
+    };
+    state.reset = function (value) { if (value !== undefined) slider.value = value; return state.sync(true); };
+    state.finish = function () { var value = state.sync(false); state.pointerActive = false; return value; };
+    state.sync(true);
+    return state;
+}
+function roundByStep(value, step, origin) { return Math.round((value - origin) / step) * step + origin; }
 function arrayContainsCaseInsensitive(array, value) { for (var i = 0; i < array.length; i++) if (String(array[i]).toUpperCase() == String(value).toUpperCase()) return true; return false; }
 function isObjectMap(value) { return !!value && typeof value == "object" && !(value instanceof Array); }
-function mergeObject(target, source) { if (!isObjectMap(target) || !isObjectMap(source)) return target; for (var key in source) if (source.hasOwnProperty(key)) target[key] = cloneObj(source[key]); return target; }
 function cloneObj(source) {
     if (source === null || source === undefined || typeof source != "object") return source;
     if (source instanceof Array) { var array = []; for (var i = 0; i < source.length; i++) array.push(cloneObj(source[i])); return array; }

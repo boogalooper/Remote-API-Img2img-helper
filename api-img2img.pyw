@@ -9,7 +9,6 @@ local temporary file.
 
 from __future__ import annotations
 
-import atexit
 import base64
 from contextlib import ExitStack, contextmanager
 import ctypes
@@ -34,24 +33,22 @@ import time
 import traceback
 import urllib.parse
 import uuid
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 API_HOST = "127.0.0.1"
 API_RECEIVE_PORT = 6380
 API_REPLY_PORT = 6381
-API_PROTOCOL = 1
-VERSION = "0.1"
+API_PROTOCOL = 2
+VERSION = "0.101"
 MAX_API_MESSAGE = 32 * 1024 * 1024
 IDLE_TIMEOUT_SECONDS = 15 * 60
 TEMP_MAX_AGE_SECONDS = 24 * 60 * 60
 
 APP = {
     "name": "Remote API img2img helper",
-    "slug": "remote-api-img2img-helper",
     "data_folder": "Remote API img2img helper",
-    "lock_file": "remote-api-img2img.lock",
-    "runtime_file": "runtime.json",
+    "startup_file": "startup.json",
     "log_file": "remote-api-img2img.log",
 }
 
@@ -95,8 +92,7 @@ def _local_appdata() -> Path:
 APP_DIR = _local_appdata() / APP["data_folder"]
 TEMP_DIR = APP_DIR / "temp"
 STATE_DIR = APP_DIR / "state"
-LOCK_FILE = STATE_DIR / APP["lock_file"]
-RUNTIME_FILE = STATE_DIR / APP["runtime_file"]
+STARTUP_FILE = STATE_DIR / APP["startup_file"]
 LOG_FILE = APP_DIR / APP["log_file"]
 for _directory in (APP_DIR, TEMP_DIR, STATE_DIR):
     _directory.mkdir(parents=True, exist_ok=True)
@@ -124,6 +120,50 @@ if sys.stderr is not None:
     LOGGER.addHandler(_console_handler)
 if not LOGGER.handlers:
     LOGGER.addHandler(logging.NullHandler())
+
+
+STARTUP_PROCESS_STARTED_AT = time.time()
+STARTUP_STATUS_LOCK = threading.Lock()
+STARTUP_STATUS: Dict[str, Any] = {
+    "status": "starting",
+    "message": "Starting Python API",
+}
+
+
+def write_startup_status(status: str, message: str = "") -> None:
+    payload = {
+        "status": str(status or "starting"),
+        "message": str(message or ""),
+        "started_at": STARTUP_PROCESS_STARTED_AT,
+        "log_file": str(LOG_FILE),
+    }
+    temp_path = STARTUP_FILE.with_name(f".{STARTUP_FILE.name}.{os.getpid()}.tmp")
+    try:
+        with STARTUP_STATUS_LOCK:
+            STARTUP_STATUS.clear()
+            STARTUP_STATUS.update(payload)
+            temp_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            os.replace(temp_path, STARTUP_FILE)
+    except OSError:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        LOGGER.warning("Could not write Python startup status: %s", STARTUP_FILE)
+
+
+def startup_status_snapshot() -> Dict[str, Any]:
+    with STARTUP_STATUS_LOCK:
+        return dict(STARTUP_STATUS)
+
+
+def remove_startup_status() -> None:
+    try:
+        STARTUP_FILE.unlink(missing_ok=True)
+    except OSError:
+        LOGGER.warning("Could not remove Python startup status: %s", STARTUP_FILE)
 
 
 def log_exception(prefix: str) -> None:
@@ -158,7 +198,9 @@ def _run_python_module(arguments: Sequence[str], timeout: int = 10 * 60) -> bool
     return completed.returncode == 0
 
 
-def ensure_python_module(import_name: str, package_name: str = "") -> Any:
+def ensure_python_module(
+    import_name: str, package_name: str = "", publish_startup: bool = False
+) -> Any:
     try:
         return importlib.import_module(import_name)
     except ImportError:
@@ -166,6 +208,8 @@ def ensure_python_module(import_name: str, package_name: str = "") -> Any:
 
     package = package_name or import_name
     LOGGER.info("Module %s is missing; installing %s", import_name, package)
+    if publish_startup:
+        write_startup_status("installing", package)
     if not _run_python_module(["pip", "--version"], timeout=60):
         if not _run_python_module(["ensurepip", "--upgrade"], timeout=5 * 60):
             raise UserVisibleError(
@@ -184,11 +228,14 @@ def ensure_python_module(import_name: str, package_name: str = "") -> Any:
         )
     importlib.invalidate_caches()
     try:
-        return importlib.import_module(import_name)
+        module = importlib.import_module(import_name)
     except ImportError as exc:
         raise UserVisibleError(
             f"{package} was installed but cannot be imported. Restart {APP_NAME}."
         ) from exc
+    if publish_startup:
+        write_startup_status("starting", "Preparing required Python modules")
+    return module
 
 
 REQUESTS: Any = None
@@ -198,8 +245,8 @@ DEEP_TRANSLATOR: Any = None
 
 def prepare_required_modules() -> None:
     global REQUESTS, PIL_IMAGE
-    REQUESTS = ensure_python_module("requests")
-    PIL_IMAGE = ensure_python_module("PIL.Image", "Pillow")
+    REQUESTS = ensure_python_module("requests", publish_startup=True)
+    PIL_IMAGE = ensure_python_module("PIL.Image", "Pillow", publish_startup=True)
     LOGGER.info("Required modules are ready: requests, Pillow")
 
 
@@ -1732,28 +1779,8 @@ def generation_worker() -> None:
             GENERATION_QUEUE.task_done()
 
 
-def apply_handshake(message: Dict[str, Any]) -> Dict[str, Any]:
-    catalog = get_catalog(force=bool(message.get("reload_cards")))
-    runtime_data = {
-        "cards_dir": str(CARDS_DIR),
-        "generation_timeout": int(message.get("generationTimeout") or 1200),
-        "updated": time.time(),
-    }
-    try:
-        RUNTIME_FILE.write_text(
-            json.dumps(runtime_data, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-    except OSError:
-        LOGGER.warning("Could not write runtime.json")
-    return {
-        "ok": True,
-        "app_dir": str(APP_DIR),
-        "log_file": str(LOG_FILE),
-        "cards_dir": str(CARDS_DIR),
-        "version": VERSION,
-        "protocol": API_PROTOCOL,
-        "catalog": catalog.public_dict(),
-    }
+def apply_handshake() -> Dict[str, Any]:
+    return {"catalog": get_catalog(force=False).public_dict()}
 
 
 def handle_command(command: Dict[str, Any]) -> None:
@@ -1762,19 +1789,45 @@ def handle_command(command: Dict[str, Any]) -> None:
     command_type = str(command.get("type") or "")
     message = command.get("message")
     if not isinstance(message, dict):
-        message = {} if message in (None, "") else {"value": message}
+        message = {}
     LOGGER.info("API command: type=%s request=%s", command_type, request_id)
     try:
         protocol = command.get("protocol")
-        if protocol is not None and str(protocol) != str(API_PROTOCOL):
+        if str(protocol or "") != str(API_PROTOCOL):
             raise UserVisibleError(
                 f"Incompatible API protocol version: {protocol}; expected {API_PROTOCOL}."
             )
         if command_type == "ping":
-            answer({"ok": True, "version": VERSION, "protocol": API_PROTOCOL}, request_id)
+            startup = startup_status_snapshot()
+            answer(
+                {
+                    "protocol": API_PROTOCOL,
+                    "startup_status": str(startup.get("status") or "starting"),
+                    "startup_message": str(startup.get("message") or ""),
+                    "startup_log_file": str(startup.get("log_file") or LOG_FILE),
+                },
+                request_id,
+            )
+            if str(startup.get("status") or "") == "error":
+                WORKER_STOP.set()
+                try:
+                    with socket.create_connection((API_HOST, API_RECEIVE_PORT), timeout=1):
+                        pass
+                except OSError:
+                    pass
             return
+
+        startup = startup_status_snapshot()
+        startup_state = str(startup.get("status") or "starting")
+        if startup_state != "ready":
+            if startup_state == "error":
+                raise UserVisibleError(
+                    str(startup.get("message") or "Python API startup failed.")
+                )
+            raise UserVisibleError("Python API is still initializing.")
+
         if command_type == "handshake":
-            answer(apply_handshake(message), request_id)
+            answer(apply_handshake(), request_id)
             return
         if command_type == "credential_encrypt":
             provider_id = str(message.get("provider_id") or "").strip()
@@ -1788,7 +1841,7 @@ def handle_command(command: Dict[str, Any]) -> None:
             answer({"encrypted": encrypted}, request_id)
             return
         if command_type == "translate":
-            text = str(message.get("text") or message.get("value") or "").strip()
+            text = str(message.get("text") or "").strip()
             if not text:
                 answer("", request_id)
                 return
@@ -1868,29 +1921,6 @@ def handle_client(client_socket: socket.socket) -> None:
             pass
 
 
-def write_lock_file() -> None:
-    data = {
-        "pid": os.getpid(),
-        "host": API_HOST,
-        "receive_port": API_RECEIVE_PORT,
-        "reply_port": API_REPLY_PORT,
-        "version": VERSION,
-        "protocol": API_PROTOCOL,
-        "started": time.time(),
-    }
-    try:
-        LOCK_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    except OSError:
-        LOGGER.warning("Could not write lock file")
-
-
-def remove_lock_file() -> None:
-    try:
-        LOCK_FILE.unlink(missing_ok=True)
-    except OSError:
-        pass
-
-
 def idle_watcher() -> None:
     while not WORKER_STOP.wait(timeout=5.0):
         with LAST_ACTIVITY_LOCK:
@@ -1906,31 +1936,59 @@ def idle_watcher() -> None:
             return
 
 
+def initialize_server_runtime() -> None:
+    """Prepare required modules and cards while the lightweight API is responsive."""
+
+    try:
+        prepare_required_modules()
+        get_catalog(force=True)
+    except Exception as exc:
+        log_exception("Critical Python initialization error")
+        write_startup_status("error", str(exc) or exc.__class__.__name__)
+        return
+
+    write_startup_status("ready", "Python API is ready")
+    try:
+        cleanup_old_temp_files()
+    except Exception:
+        log_exception("Background temporary-file cleanup failed")
+
+
 def start_local_server() -> None:
-    cleanup_old_temp_files()
-    prepare_required_modules()
-    get_catalog(force=True)
-    write_lock_file()
-    atexit.register(remove_lock_file)
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        server.bind((API_HOST, API_RECEIVE_PORT))
+    except OSError as exc:
+        LOGGER.error("Could not bind port %s: %s", API_RECEIVE_PORT, exc)
+        write_startup_status(
+            "error", f"Could not open local Python API port {API_RECEIVE_PORT}: {exc}"
+        )
+        try:
+            server.close()
+        except OSError:
+            pass
+        return
+
+    server.listen(8)
+    server.settimeout(1.0)
+    write_startup_status("starting", "Preparing Python API")
+
+    initialization_thread = threading.Thread(
+        target=initialize_server_runtime, name="InitializationWorker", daemon=True
+    )
+    initialization_thread.start()
 
     worker = threading.Thread(target=generation_worker, name="GenerationWorker", daemon=True)
     worker.start()
     watcher = threading.Thread(target=idle_watcher, name="IdleWatcher", daemon=True)
     watcher.start()
 
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    LOGGER.info(
+        "%s %s listening on %s:%s",
+        APP_NAME, VERSION, API_HOST, API_RECEIVE_PORT,
+    )
     try:
-        server.bind((API_HOST, API_RECEIVE_PORT))
-        server.listen(8)
-        server.settimeout(1.0)
-        LOGGER.info(
-            "%s %s listening on %s:%s",
-            APP_NAME,
-            VERSION,
-            API_HOST,
-            API_RECEIVE_PORT,
-        )
         while not WORKER_STOP.is_set():
             try:
                 client, _address = server.accept()
@@ -1941,23 +1999,23 @@ def start_local_server() -> None:
                     break
                 raise
             threading.Thread(
-                target=handle_client,
-                args=(client,),
-                name="LocalClient",
-                daemon=True,
+                target=handle_client, args=(client,), name="LocalClient", daemon=True
             ).start()
     finally:
         WORKER_STOP.set()
+        cancel_current_generation()
         try:
             server.close()
         except OSError:
             pass
-        remove_lock_file()
+        remove_startup_status()
+        LOGGER.info("%s stopped", APP_NAME)
 
 
 if __name__ == "__main__":
+    write_startup_status("starting", "Starting Python API")
     try:
         start_local_server()
-    except Exception:
-        log_exception("Fatal API server error")
-        raise
+    except Exception as exc:
+        log_exception("Critical startup error")
+        write_startup_status("error", str(exc) or exc.__class__.__name__)
