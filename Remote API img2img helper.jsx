@@ -32,7 +32,7 @@ var APP = {
         property: "generationSettings"
     }
 },
-    VER = "0.124",
+    VER = "0.125",
     SETTINGS_DATA_VERSION = 2,
     ACTION_DATA_VERSION = 4,
     // Отладочный флаг должен оставаться false в рабочей сборке. При true
@@ -40,9 +40,10 @@ var APP = {
     DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
     API_FILE = "api-img2img",
     API_HOST = "127.0.0.1",
-    API_PORT_SEND = 6380,
-    API_PORT_LISTEN = 6381,
+    API_PORT_SEND = 6390,
+    API_PORT_LISTEN = 6391,
     API_PROTOCOL = 2,
+    API_APP_ID = "remote-api-img2img-helper",
     // Локальный listener поднимается сразу; этот таймаут включает подготовку обязательных зависимостей.
     START_TIMEOUT = 2 * 60 * 1000,
     SHORT_TIMEOUT = 8000,
@@ -1707,6 +1708,9 @@ function BridgeApi() {
         return lastStatus || false;
     }
     function validatePythonProtocol(info) {
+        if (String(info && info.app_id || "") != API_APP_ID)
+            throw new Error("Another Python service is using Remote API img2img helper port " +
+                API_PORT_SEND + ". Expected " + API_APP_ID + ".");
         if (String(info && info.protocol) != String(API_PROTOCOL))
             throw new Error(cardText(str.errApiProtocolA) + (info ? info.protocol : "") +
                 cardText(str.errApiProtocolB) + API_PROTOCOL + ".");
