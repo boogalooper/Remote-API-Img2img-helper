@@ -10,6 +10,7 @@ local temporary file.
 from __future__ import annotations
 
 import base64
+import copy
 from contextlib import ExitStack, contextmanager
 import ctypes
 from ctypes import wintypes
@@ -20,11 +21,13 @@ import json
 import logging
 import math
 from logging.handlers import RotatingFileHandler
+import multiprocessing
 import mimetypes
 import os
 from pathlib import Path
 import queue
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -35,7 +38,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 
 API_HOST = "127.0.0.1"
@@ -43,7 +46,8 @@ API_RECEIVE_PORT = 6390
 API_REPLY_PORT = 6391
 API_PROTOCOL = 2
 API_APP_ID = "remote-api-img2img-helper"
-VERSION = "0.102"
+VERSION = "0.103"
+API_BUILD_ID = "0.126-jazzyscripts-local-only"
 MAX_API_MESSAGE = 32 * 1024 * 1024
 IDLE_TIMEOUT_SECONDS = 15 * 60
 TEMP_MAX_AGE_SECONDS = 24 * 60 * 60
@@ -92,7 +96,7 @@ def _local_appdata() -> Path:
     return Path.home() / ".local" / "share"
 
 
-APP_DIR = _local_appdata() / APP["data_folder"]
+APP_DIR = _local_appdata() / "JazzyScripts" / APP["data_folder"]
 TEMP_DIR = APP_DIR / "temp"
 STATE_DIR = APP_DIR / "state"
 STARTUP_FILE = STATE_DIR / APP["startup_file"]
@@ -159,7 +163,7 @@ def write_startup_status(status: str, message: str = "") -> None:
 
 def startup_status_snapshot() -> Dict[str, Any]:
     with STARTUP_STATUS_LOCK:
-        return dict(STARTUP_STATUS)
+        return copy.deepcopy(STARTUP_STATUS)
 
 
 def remove_startup_status() -> None:
@@ -202,41 +206,59 @@ def _run_python_module(arguments: Sequence[str], timeout: int = 10 * 60) -> bool
 
 
 def ensure_python_module(
-    import_name: str, package_name: str = "", publish_startup: bool = False
+    import_name: str,
+    package_name: str = "",
+    *,
+    publish_startup_status: bool = True,
 ) -> Any:
+    """Import a module and install it through pip when necessary."""
+
     try:
         return importlib.import_module(import_name)
     except ImportError:
         pass
 
     package = package_name or import_name
-    LOGGER.info("Module %s is missing; installing %s", import_name, package)
-    if publish_startup:
+    LOGGER.info(
+        "Module %s was not found; starting automatic installation of %s",
+        import_name,
+        package,
+    )
+    if publish_startup_status:
         write_startup_status("installing", package)
+
     if not _run_python_module(["pip", "--version"], timeout=60):
+        LOGGER.info("pip is unavailable; running ensurepip")
         if not _run_python_module(["ensurepip", "--upgrade"], timeout=5 * 60):
             raise UserVisibleError(
-                f"Could not prepare pip to install {package}. Details: {LOG_FILE}"
+                f"Could not prepare pip to install module {package}. "
+                f"Details: {LOG_FILE}"
             )
+
     installed = _run_python_module(
         ["pip", "install", "--disable-pip-version-check", package]
     )
     if not installed:
+        LOGGER.info("Regular installation failed; retrying with --user")
         installed = _run_python_module(
             ["pip", "install", "--user", "--disable-pip-version-check", package]
         )
     if not installed:
         raise UserVisibleError(
-            f"Could not automatically install {package}. Details: {LOG_FILE}"
+            f"Could not automatically install Python module {package}. "
+            f"Check the internet connection and log: {LOG_FILE}"
         )
+
     importlib.invalidate_caches()
     try:
         module = importlib.import_module(import_name)
     except ImportError as exc:
         raise UserVisibleError(
-            f"{package} was installed but cannot be imported. Restart {APP_NAME}."
+            f"Module {package} was installed, but Python could not import it. "
+            f"Restart {APP_NAME}. Log: {LOG_FILE}"
         ) from exc
-    if publish_startup:
+    LOGGER.info("Module %s was installed and loaded successfully", package)
+    if publish_startup_status:
         write_startup_status("starting", "Preparing required Python modules")
     return module
 
@@ -247,9 +269,9 @@ PIL_IMAGE: Any = None
 
 def prepare_required_modules() -> None:
     global REQUESTS, PIL_IMAGE
-    REQUESTS = ensure_python_module("requests", publish_startup=True)
-    PIL_IMAGE = ensure_python_module("PIL.Image", "Pillow", publish_startup=True)
-    LOGGER.info("Required modules are ready: requests, Pillow")
+    REQUESTS = ensure_python_module("requests", publish_startup_status=True)
+    PIL_IMAGE = ensure_python_module("PIL.Image", "Pillow", publish_startup_status=True)
+    LOGGER.info("Required Python modules are ready: requests, Pillow")
 
 
 
@@ -732,7 +754,6 @@ def cleanup_old_temp_files() -> None:
             try:
                 if child.stat().st_mtime < threshold:
                     if child.is_dir():
-                        import shutil
                         shutil.rmtree(child, ignore_errors=True)
                     else:
                         child.unlink(missing_ok=True)
@@ -743,7 +764,19 @@ def cleanup_old_temp_files() -> None:
 
 
 class UserVisibleError(RuntimeError):
-    pass
+    """Expected failure returned to JSX without a technical traceback."""
+
+    def __init__(
+        self,
+        message: str,
+        code: str = "",
+        params: Optional[Sequence[Any]] = None,
+        details: Optional[Sequence[Any]] = None,
+    ) -> None:
+        super().__init__(str(message or ""))
+        self.code = str(code or "")
+        self.params = [str(value) for value in params] if params else []
+        self.details = list(details) if details else []
 
 
 class CancelledError(UserVisibleError):
@@ -1915,6 +1948,79 @@ def normalize_result_image(image_bytes: bytes, destination: Path) -> Tuple[Path,
     return destination, width, height
 
 
+def _adapter_process(job, adapter_id, result_path, pipe):
+    """Isolated network owner; terminating it closes every request/download socket."""
+    global REQUESTS
+    # Only the parent owns the rotating log file (Windows file sharing/rotation).
+    for handler in list(LOGGER.handlers):
+        if isinstance(handler, RotatingFileHandler):
+            LOGGER.removeHandler(handler)
+            handler.close()
+    try:
+        REQUESTS = importlib.import_module("requests")
+        result = ADAPTERS[adapter_id]().execute(job, threading.Event())
+        Path(result_path).write_bytes(result.image_bytes)
+        result.image_bytes = b""
+        pipe.send((True, result))
+    except Exception as exc:
+        pipe.send((False, str(exc)))
+    finally:
+        job.api_key = ""
+        pipe.close()
+
+
+def execute_cancellable_adapter(job, adapter_id, cancel_event):
+    # Each child owns only this task. Never reset global state while an old
+    # request can still write results or hold the next generation's slot.
+    ctx = multiprocessing.get_context("spawn")
+    receiver, sender = ctx.Pipe(duplex=False)
+    result_path = TEMP_DIR / ("transfer-" + uuid.uuid4().hex + ".bin")
+    process = ctx.Process(target=_adapter_process,
+                          args=(job, adapter_id, str(result_path), sender), daemon=True)
+    started = False
+    deadline = time.monotonic() + job.timeout
+    try:
+        if cancel_event.is_set():
+            raise CancelledError("Generation was cancelled.")
+        LOGGER.info("Starting isolated API request: request=%s adapter=%s", job.request_id, adapter_id)
+        process.start()
+        started = True
+        sender.close()
+        while True:
+            if cancel_event.is_set():
+                raise CancelledError("Generation was cancelled.")
+            if time.monotonic() >= deadline:
+                raise UserVisibleError("The remote API generation timed out.")
+            if receiver.poll(0.05):
+                try:
+                    ok, value = receiver.recv()
+                except EOFError as exc:
+                    raise UserVisibleError("The API request process stopped unexpectedly.") from exc
+                if cancel_event.is_set():
+                    raise CancelledError("Generation was cancelled.")
+                if not ok:
+                    raise UserVisibleError(value)
+                value.image_bytes = result_path.read_bytes()
+                return value
+            if not process.is_alive():
+                raise UserVisibleError("The API request process stopped unexpectedly.")
+    finally:
+        if started:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=3)
+            if process.is_alive():
+                process.kill()
+                process.join()
+            process.close()
+        sender.close()
+        receiver.close()
+        try:
+            result_path.unlink(missing_ok=True)
+        except OSError:
+            LOGGER.warning("Could not remove temporary API transfer file")
+
+
 # ---------------------------------------------------------------------------
 # Local socket protocol and generation lifecycle
 # ---------------------------------------------------------------------------
@@ -1923,6 +2029,7 @@ def normalize_result_image(image_bytes: bytes, destination: Path) -> Tuple[Path,
 @dataclass
 class GenerationState:
     request_id: Optional[str] = None
+    queued_request_id: Optional[str] = None
     provider_id: str = ""
     model_id: str = ""
     cancel_event: threading.Event = field(default_factory=threading.Event)
@@ -1933,11 +2040,13 @@ class GenerationState:
 
 GENERATION = GenerationState()
 GENERATION_QUEUE: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=1)
-GENERATION_SUBMIT_LOCK = threading.Lock()
+GENERATION_SUBMIT_LOCK = threading.RLock()
 WORKER_STOP = threading.Event()
 LAST_ACTIVITY = time.monotonic()
 LAST_ACTIVITY_LOCK = threading.Lock()
 REPLY_LOCK = threading.Lock()
+CANCELLED_REQUESTS: Set[str] = set()
+CANCELLED_REQUESTS_LOCK = threading.Lock()
 
 
 def touch_activity() -> None:
@@ -1948,45 +2057,63 @@ def touch_activity() -> None:
 
 @contextmanager
 def generation_context(task: Dict[str, Any]):
+    """Common lifecycle for one queued Remote API generation."""
+
     request_id = str(task.get("request_id") or uuid.uuid4())
     task["request_id"] = request_id
-    GENERATION.request_id = request_id
-    GENERATION.provider_id = ""
-    GENERATION.model_id = ""
-    GENERATION.cancel_event.clear()
-    GENERATION.ack_event.clear()
-    GENERATION.active = True
-    GENERATION.queued = False
+    with GENERATION_SUBMIT_LOCK:
+        GENERATION.request_id = request_id
+        GENERATION.queued_request_id = None
+        GENERATION.provider_id = ""
+        GENERATION.model_id = ""
+        GENERATION.cancel_event.clear()
+        GENERATION.ack_event.clear()
+        GENERATION.active = True
+        GENERATION.queued = False
     try:
+        # A cancel may arrive after queue.put() but before the worker activates
+        # this request. CANCELLED_REQUESTS preserves that early cancellation.
         raise_if_generation_cancelled(request_id)
         yield request_id
     finally:
-        GENERATION.request_id = None
-        GENERATION.provider_id = ""
-        GENERATION.model_id = ""
-        GENERATION.active = False
-        GENERATION.queued = False
-        GENERATION.cancel_event.clear()
-        GENERATION.ack_event.clear()
-        touch_activity()
+        with GENERATION_SUBMIT_LOCK:
+            with CANCELLED_REQUESTS_LOCK:
+                CANCELLED_REQUESTS.discard(request_id)
+            GENERATION.request_id = None
+            GENERATION.queued_request_id = None
+            GENERATION.provider_id = ""
+            GENERATION.model_id = ""
+            GENERATION.active = False
+            GENERATION.queued = False
+            GENERATION.cancel_event.clear()
+            GENERATION.ack_event.clear()
+            touch_activity()
 
 
 def send_data_to_jsx(message: Dict[str, Any], retries: int = 20) -> bool:
+    """Send one ASCII-only JSON response to the local JSX listener."""
+
     try:
         payload = (api_json_dumps(message) + "\n").encode("ascii")
     except Exception:
         log_exception("Could not serialize the JSX response")
         return False
+
     LOGGER.info(
-        "JSX response: type=%s request=%s bytes=%s",
+        "JSX response: type=%s request=%s bytes=%s transport=socket ascii=true",
         message.get("type"),
         message.get("request_id"),
         len(payload),
     )
+
     with REPLY_LOCK:
         for attempt in range(retries):
+            if message.get("request_id") and request_is_cancelled(str(message["request_id"])):
+                raise CancelledError("Generation was cancelled.")
             try:
-                with socket.create_connection((API_HOST, API_REPLY_PORT), timeout=2.0) as sock:
+                with socket.create_connection(
+                    (API_HOST, API_REPLY_PORT), timeout=2.0
+                ) as sock:
                     sock.settimeout(10.0)
                     sock.sendall(payload)
                 return True
@@ -1994,7 +2121,12 @@ def send_data_to_jsx(message: Dict[str, Any], retries: int = 20) -> bool:
                 if attempt + 1 < retries:
                     time.sleep(0.05)
                 else:
-                    LOGGER.error("Could not send JSX response: %s", exc)
+                    LOGGER.error(
+                        "Could not send JSX response: type=%s request=%s error=%s",
+                        message.get("type"),
+                        message.get("request_id"),
+                        exc,
+                    )
     return False
 
 
@@ -2009,29 +2141,26 @@ def answer(message: Any, request_id: Optional[str] = None) -> None:
     )
 
 
-def error_answer(message: str, request_id: Optional[str] = None) -> None:
-    send_data_to_jsx(
-        {
-            "protocol": API_PROTOCOL,
-            "request_id": request_id,
-            "type": "error",
-            "message": str(message),
-        }
-    )
-
-
-def cancelled_answer(request_id: Optional[str] = None) -> None:
-    send_data_to_jsx(
-        {
-            "protocol": API_PROTOCOL,
-            "request_id": request_id,
-            "type": "cancelled",
-            "message": "Generation was cancelled.",
-        }
-    )
+def error_answer(message: Any, request_id: Optional[str] = None, retries: int = 20) -> None:
+    payload: Dict[str, Any] = {
+        "protocol": API_PROTOCOL,
+        "request_id": request_id,
+        "type": "error",
+        "message": str(message or ""),
+    }
+    if isinstance(message, UserVisibleError):
+        if message.code:
+            payload["code"] = message.code
+        if message.params:
+            payload["params"] = message.params
+        if message.details:
+            payload["details"] = message.details
+    send_data_to_jsx(payload, retries=retries)
 
 
 def notify_generation_progress_ready(request_id: str, model_label: str) -> None:
+    """Switch Photoshop from preparation progress to remote-generation progress."""
+
     raise_if_generation_cancelled(request_id)
     GENERATION.ack_event.clear()
     payload = {
@@ -2042,20 +2171,47 @@ def notify_generation_progress_ready(request_id: str, model_label: str) -> None:
         "backend": "api",
         "model": model_label,
     }
+    LOGGER.info(
+        "Progress stage ready: backend=api request=%s model=%s",
+        request_id,
+        model_label or "-",
+    )
     if not send_data_to_jsx(payload):
         raise UserVisibleError(
-            "Could not switch Photoshop to the remote-generation stage."
+            "Could not switch Photoshop to the remote-generation stage: "
+            "the progress listener is unavailable."
         )
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
         if GENERATION.ack_event.wait(timeout=0.1):
+            LOGGER.info("Progress ACK received: request=%s", request_id)
             return
         raise_if_generation_cancelled(request_id)
     LOGGER.warning("Progress ACK timeout: request=%s; continuing", request_id)
 
 
+def mark_request_cancelled(request_id: Optional[str]) -> str:
+    requested = str(request_id or "")
+    current = str(GENERATION.request_id or GENERATION.queued_request_id or "")
+    # Ignore delayed interrupts after completion and IDs that belong to another
+    # request. This also keeps CANCELLED_REQUESTS bounded.
+    if requested and (not current or requested != current):
+        return ""
+    normalized = requested or current
+    if not normalized:
+        return ""
+    with CANCELLED_REQUESTS_LOCK:
+        CANCELLED_REQUESTS.add(normalized)
+    return normalized
+
+
 def request_is_cancelled(request_id: str) -> bool:
-    return bool(GENERATION.request_id == request_id and GENERATION.cancel_event.is_set())
+    if GENERATION.cancel_event.is_set() and (
+        not GENERATION.request_id or GENERATION.request_id == request_id
+    ):
+        return True
+    with CANCELLED_REQUESTS_LOCK:
+        return request_id in CANCELLED_REQUESTS
 
 
 def raise_if_generation_cancelled(request_id: str) -> None:
@@ -2064,11 +2220,12 @@ def raise_if_generation_cancelled(request_id: str) -> None:
 
 
 def cancel_current_generation(request_id: Optional[str] = None) -> None:
-    current = GENERATION.request_id
-    requested = str(request_id or "")
-    if current and (not requested or requested == current):
+    with GENERATION_SUBMIT_LOCK:
+        normalized = mark_request_cancelled(request_id)
+        if not normalized:
+            return
         GENERATION.cancel_event.set()
-        LOGGER.info("Cancellation requested: %s", current)
+        LOGGER.info("Cancellation requested: %s", normalized)
 
 
 def _path_from_message(value: Any, label: str, required: bool = True) -> Optional[Path]:
@@ -2145,9 +2302,8 @@ def _run_api_generation(task: Dict[str, Any], request_id: str) -> None:
     )
 
     notify_generation_progress_ready(request_id, str(model.get("label") or model_id))
-    adapter = adapter_class()
     try:
-        result = adapter.execute(job, GENERATION.cancel_event)
+        result = execute_cancellable_adapter(job, adapter_id, GENERATION.cancel_event)
     finally:
         job.api_key = ""
         api_key = ""
@@ -2189,13 +2345,13 @@ def generation_worker() -> None:
             with generation_context(task) as request_id:
                 _run_api_generation(task, request_id)
         except CancelledError:
-            cancelled_answer(task.get("request_id"))
+            LOGGER.info("Cancelled task released: %s", task.get("request_id"))
         except UserVisibleError as exc:
             LOGGER.warning("Generation error: %s", exc)
-            error_answer(str(exc), task.get("request_id"))
+            error_answer(exc, task.get("request_id"), retries=1)
         except Exception as exc:
             log_exception("Unhandled generation error")
-            error_answer(f"Internal Python error: {exc}", task.get("request_id"))
+            error_answer(f"Internal Python error: {exc}", task.get("request_id"), retries=1)
         finally:
             GENERATION_QUEUE.task_done()
 
@@ -2224,6 +2380,7 @@ def handle_command(command: Dict[str, Any]) -> None:
                 {
                     "protocol": API_PROTOCOL,
                     "app_id": API_APP_ID,
+                    "build_id": API_BUILD_ID,
                     "startup_status": str(startup.get("status") or "starting"),
                     "startup_message": str(startup.get("message") or ""),
                     "startup_log_file": str(startup.get("log_file") or LOG_FILE),
@@ -2237,6 +2394,16 @@ def handle_command(command: Dict[str, Any]) -> None:
                         pass
                 except OSError:
                     pass
+            return
+
+        if command_type == "shutdown":
+            answer({"stopping": True, "build_id": API_BUILD_ID}, request_id)
+            WORKER_STOP.set()
+            try:
+                with socket.create_connection((API_HOST, API_RECEIVE_PORT), timeout=1):
+                    pass
+            except OSError:
+                pass
             return
 
         startup = startup_status_snapshot()
@@ -2281,6 +2448,7 @@ def handle_command(command: Dict[str, Any]) -> None:
                 if GENERATION.active or GENERATION.queued or not GENERATION_QUEUE.empty():
                     raise UserVisibleError("The previous generation has not finished yet.")
                 GENERATION.queued = True
+                GENERATION.queued_request_id = str(request_id or "")
                 GENERATION_QUEUE.put(command)
             return
         if command_type == "ack":
@@ -2288,12 +2456,26 @@ def handle_command(command: Dict[str, Any]) -> None:
             if not GENERATION.request_id or not ack_request_id or ack_request_id == GENERATION.request_id:
                 GENERATION.ack_event.set()
             return
+        if command_type == "cancel_generation":
+            target = str(message.get("request_id") or "")
+            if not target:
+                raise UserVisibleError("Missing cancellation request ID.")
+            cancel_current_generation(target)
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                with GENERATION_SUBMIT_LOCK:
+                    released = target != (GENERATION.request_id or GENERATION.queued_request_id)
+                if released:
+                    answer({"cancelled": True, "released": True}, request_id)
+                    return
+                time.sleep(0.05)
+            raise UserVisibleError("Cancellation is still finishing. Please retry shortly.")
         if command_type == "interrupt":
             cancel_current_generation(str(message.get("request_id") or request_id or ""))
             return
         raise UserVisibleError(f"Unknown API command: {command_type}")
     except UserVisibleError as exc:
-        error_answer(str(exc), request_id)
+        error_answer(exc, request_id)
     except Exception as exc:
         log_exception(f"Command error: {command_type}")
         error_answer(f"Internal Python error: {exc}", request_id)
@@ -2310,32 +2492,33 @@ def receive_json_message(client_socket: socket.socket) -> Dict[str, Any]:
         chunks.append(chunk)
         total += len(chunk)
         if total > MAX_API_MESSAGE:
-            raise UserVisibleError("The local API message is too large.")
+            raise UserVisibleError("Incoming API message is too large.")
         if b"\n" in chunk:
             break
     raw = b"".join(chunks).split(b"\n", 1)[0]
     if not raw:
-        raise UserVisibleError("The local API received an empty command.")
+        return {}
     try:
-        value = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise UserVisibleError(f"The local API received invalid JSON: {exc}") from exc
+        value = json.loads(raw.decode("utf-8-sig"))
+    except Exception as exc:
+        raise UserVisibleError("Python received invalid JSON from JSX.") from exc
     if not isinstance(value, dict):
-        raise UserVisibleError("The local API command must be a JSON object.")
+        raise UserVisibleError("The API message root must be an object.")
     return value
 
 
 def handle_client(client_socket: socket.socket) -> None:
     try:
         command = receive_json_message(client_socket)
-        handle_command(command)
+        # TCP connect/disconnect without JSON is a health probe from JSX or the
+        # idle watcher. Do not try to answer it because no JSX listener exists.
+        if command:
+            handle_command(command)
     except UserVisibleError as exc:
-        # JSX checks whether the server is running by opening and immediately
-        # closing the port. That empty connection is a health probe, not an error.
-        if str(exc) != "The local API received an empty command.":
-            LOGGER.warning("Local client error: %s", exc)
+        error_answer(exc)
     except Exception:
-        log_exception("Local client handler error")
+        log_exception("TCP client handling error")
+        error_answer("Photoshop local connection to Python failed.")
     finally:
         try:
             client_socket.close()
@@ -2347,7 +2530,12 @@ def idle_watcher() -> None:
     while not WORKER_STOP.wait(timeout=5.0):
         with LAST_ACTIVITY_LOCK:
             idle = time.monotonic() - LAST_ACTIVITY
-        if idle >= IDLE_TIMEOUT_SECONDS and not GENERATION.active and GENERATION_QUEUE.empty():
+        if (
+            idle >= IDLE_TIMEOUT_SECONDS
+            and not GENERATION.active
+            and not GENERATION.queued
+            and GENERATION_QUEUE.empty()
+        ):
             LOGGER.info("Idle timeout reached; stopping local server")
             WORKER_STOP.set()
             try:
@@ -2401,27 +2589,37 @@ def start_local_server() -> None:
     )
     initialization_thread.start()
 
-    worker = threading.Thread(target=generation_worker, name="GenerationWorker", daemon=True)
-    worker.start()
-    watcher = threading.Thread(target=idle_watcher, name="IdleWatcher", daemon=True)
-    watcher.start()
+    worker_thread = threading.Thread(
+        target=generation_worker, name="GenerationWorker", daemon=True
+    )
+    worker_thread.start()
+    watcher_thread = threading.Thread(
+        target=idle_watcher, name="IdleWatcher", daemon=True
+    )
+    watcher_thread.start()
 
     LOGGER.info(
-        "%s %s listening on %s:%s",
-        APP_NAME, VERSION, API_HOST, API_RECEIVE_PORT,
+        "%s %s listener started. API %s:%s, build=%s, log=%s",
+        APP_NAME,
+        VERSION,
+        API_HOST,
+        API_RECEIVE_PORT,
+        API_BUILD_ID,
+        LOG_FILE,
     )
     try:
         while not WORKER_STOP.is_set():
             try:
-                client, _address = server.accept()
+                client_socket, _ = server.accept()
             except socket.timeout:
                 continue
             except OSError:
-                if WORKER_STOP.is_set():
-                    break
-                raise
+                break
             threading.Thread(
-                target=handle_client, args=(client,), name="LocalClient", daemon=True
+                target=handle_client,
+                args=(client_socket,),
+                name="APIClient",
+                daemon=True,
             ).start()
     finally:
         WORKER_STOP.set()
@@ -2435,6 +2633,7 @@ def start_local_server() -> None:
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     write_startup_status("starting", "Starting Python API")
     try:
         start_local_server()

@@ -1,4 +1,4 @@
-#target photoshop
+﻿#target photoshop
 /*
 // BEGIN__HARVEST_EXCEPTION_ZSTRING
 <javascriptresource>
@@ -32,9 +32,9 @@ var APP = {
         property: "generationSettings"
     }
 },
-    VER = "0.125",
+    VER = "0.126",
     SETTINGS_DATA_VERSION = 2,
-    ACTION_DATA_VERSION = 4,
+    ACTION_DATA_VERSION = 5,
     // Отладочный флаг должен оставаться false в рабочей сборке. При true
     // главное окно открывается всегда, независимо от сохранённого тихого режима.
     DEBUG_FIRST_LAUNCH_WITH_INTERFACE = false,
@@ -44,6 +44,7 @@ var APP = {
     API_PORT_LISTEN = 6391,
     API_PROTOCOL = 2,
     API_APP_ID = "remote-api-img2img-helper",
+    API_BUILD_ID = "0.126-jazzyscripts-local-only",
     // Локальный listener поднимается сразу; этот таймаут включает подготовку обязательных зависимостей.
     START_TIMEOUT = 2 * 60 * 1000,
     SHORT_TIMEOUT = 8000,
@@ -54,6 +55,8 @@ var APP = {
     GENERATION_RUN_SEGMENT = 80,
     GENERATION_TOTAL_SEGMENTS = 100,
     PROGRESS_STAGE_TARGET = 0.95,
+    API_POLL_INTERVAL = 25,
+    API_POLL_SLEEP = 5,
     REFERENCE_IMAGE_FILTER = "JPEG/PNG/WebP:*.jpg;*.jpeg;*.png;*.webp",
     startupStartedAt = (new Date()).getTime(),
     s2t = stringIDToTypeID,
@@ -78,17 +81,21 @@ var APP = {
     isCancelled = false,
     actionPlaybackMode = false,
     actionUsesRecordedSettings = false,
+    interfaceWasShown = false,
     globalSettings = null,
     settingsReady = false,
     skipSettingsSaveOnError = false,
     keyboardState = ScriptUI.environment.keyboardState;
 
+var launchArguments = { dialog: false, file: null }, filePlaybackMode = false, topLevelArguments = [];
+try { if (typeof arguments != "undefined") for (var ai = 0; ai < arguments.length; ai++) topLevelArguments.push(arguments[ai]); } catch (_) { }
 try { init(); }
 catch (e) {
     if (startupProgress) { try { startupProgress.close(); } catch (_) { } startupProgress = null; }
-    if (String(e.message) == APP.cancelToken) {
-        api.interrupt(generationProgress.getRequestId());
+    if (isUserCancellation(e)) {
         isCancelled = true;
+    } else if (filePlaybackMode || (actionPlaybackMode && app.playbackDisplayDialogs != DialogModes.ALL)) {
+        throw e;
     } else {
         var settingsSaveError = (generationResultPlaced || skipSettingsSaveOnError) ? "" : action.saveAfterError(),
             errorText = APP.name + "\n\n" + errorMessageText(e) +
@@ -97,8 +104,8 @@ catch (e) {
             "\n" + settingsSaveError;
         ui.showErrorMessage(errorText, APP.name);
         isCancelled = false;
+        $.setenv(APP.dialogEnvKey, "true");
     }
-    $.setenv(APP.dialogEnvKey, "true");
 }
 finally { restoreInitialDocumentState(); }
 isCancelled ? "cancel" : undefined;
@@ -114,6 +121,24 @@ function errorMessageText(value) {
     if (value.message !== undefined) return String(value.message);
     if (typeof value == "object" && (value.ru !== undefined || value.en !== undefined || value.label !== undefined)) return cardText(value);
     return String(value);
+}
+
+function userCancellationError() {
+    var error = new Error(APP.cancelToken);
+    error.img2imgUserCancelled = true;
+    return error;
+}
+
+function isUserCancellation(value) {
+    if (value === false) return true;
+    if (!value) return false;
+    if (value.img2imgUserCancelled === true) return true;
+    if (String(value.type || "").toLowerCase() == "cancelled") return true;
+    var number = Number(value.number);
+    if (number == 8007 || number == -128) return true;
+    var message = errorMessageText(value).replace(/^\s+|\s+$/g, "");
+    if (message == APP.cancelToken) return true;
+    return /^(?:error:\s*)?(?:user (?:cancelled|canceled)(?: the operation)?|operation (?:cancelled|canceled))[.!]?$/i.test(message);
 }
 
 function cardText(value) {
@@ -135,7 +160,10 @@ function init() {
     var playbackCount = action.getPlaybackParameterCount(),
         settingsWarnings = [];
     actionPlaybackMode = action.isPlayback();
-    var forceDialog = keyboardState.shiftKey || (!actionPlaybackMode && action.hasInterfaceArgument());
+    launchArguments = action.readLaunchArguments();
+    filePlaybackMode = !!launchArguments.file;
+    actionPlaybackMode = actionPlaybackMode || filePlaybackMode;
+    var forceDialog = !actionPlaybackMode && ((keyboardState.shiftKey && !keyboardState.ctrlKey && !keyboardState.altKey && !keyboardState.metaKey) || launchArguments.dialog);
     if (actionPlaybackMode) {
         // При playback сначала всегда загружается актуальный глобальный DESC.
         // Action не является отдельной конфигурацией скрипта: он может только
@@ -144,8 +172,8 @@ function init() {
         globalSettings.load();
         settingsWarnings = settingsWarnings.concat(globalSettings.consumeLoadWarnings());
         cfg.copyAllDataFrom(globalSettings);
-        actionUsesRecordedSettings = action.getRecordedSettingsMode();
-        if (actionUsesRecordedSettings) cfg.loadModelFromAction();
+        actionUsesRecordedSettings = filePlaybackMode || action.getRecordedSettingsMode();
+        if (actionUsesRecordedSettings) cfg.loadModelFromAction(launchArguments.file);
     } else {
         cfg.load();
         settingsWarnings = settingsWarnings.concat(cfg.consumeLoadWarnings());
@@ -155,9 +183,9 @@ function init() {
     cfg.cleanReferenceHistory();
 
     var environmentMode = DEBUG_FIRST_LAUNCH_WITH_INTERFACE ? null : $.getenv(APP.dialogEnvKey),
-        showInterface = DEBUG_FIRST_LAUNCH_WITH_INTERFACE || (actionPlaybackMode
+        showInterface = !filePlaybackMode && (DEBUG_FIRST_LAUNCH_WITH_INTERFACE || (actionPlaybackMode
             ? forceDialog || app.playbackDisplayDialogs == DialogModes.ALL
-            : forceDialog || environmentMode == "true" || environmentMode == null),
+            : forceDialog || environmentMode == "true" || environmentMode == null)),
         selection = { result: false, bounds: null, sourceBounds: null, previousGeneration: null, junk: null, flattenedSource: null };
 
     app.activeDocument.suspendHistory(localize(str.historyCheckSelection), "checkSelection(selection)");
@@ -189,6 +217,8 @@ function init() {
             }
         }
         if (selectionChanged || notices.length || !hasProviderCredential(cfg.selectedProvider)) {
+            if (filePlaybackMode || (actionPlaybackMode && app.playbackDisplayDialogs != DialogModes.ALL))
+                throw new Error(notices.join("\n") || cardText(str.errSilentSettings));
             showInterface = true;
             $.setenv(APP.dialogEnvKey, "true");
         }
@@ -197,6 +227,7 @@ function init() {
         initial.notices = notices;
 
         if (showInterface) {
+            interfaceWasShown = true;
             var res = mainDialog(selection, initial, responseSeconds);
             if (!res || res.cancelled) {
                 if (res && res.saveSettings) action.saveAcceptedSettings();
@@ -471,6 +502,14 @@ function mainDialog(selection, initial, responseSeconds) {
                 model = findModel(catalog, cfg.selectedModel),
                 profile = cfg.getModelProfile(cfg.selectedModel, model);
             if (!provider || !model || model.provider != provider.id) throw new Error(cardText(str.errNoModelSelected));
+            if (ScriptUI.environment.keyboardState.shiftKey) {
+                var exportFile = File.saveDialog("Сохранить параметры / Save settings", "DESC:*.desc");
+                if (exportFile) {
+                    if (!/\.desc$/i.test(exportFile.name)) exportFile = new File(exportFile.fsName + ".desc");
+                    cfg.exportSnapshot(exportFile);
+                }
+                return;
+            }
             if (!trimText(profile.prompt)) throw new Error(cardText(str.errPromptEmpty));
             if (!hasProviderCredential(provider.id)) throw new Error(cardText(str.errApiKeyMissing));
             result = { cancelled: false, provider: provider, model: model, profile: profile };
@@ -1184,10 +1223,17 @@ function GenerationRuntime() {
                 },
                 timingKey = String(provider.id) + ":" + String(model.id);
             generationProgress.begin({ command: command, titles: titles, timingKey: timingKey, timingMax: generationTimings.getDelay(timingKey), requestId: requestId });
-            app.doProgress(titles.window, "runGenerationProgress()");
+            var progressCompleted;
+            try {
+                progressCompleted = app.doProgress(titles.window, "runGenerationProgress()");
+            } catch (progressError) {
+                if (!isUserCancellation(progressError)) throw progressError;
+                progressCompleted = false;
+            }
             var progressResult = generationProgress.getResult();
-            if (progressResult === false || (progressResult && progressResult.type == "cancelled")) {
-                $.setenv(APP.dialogEnvKey, "true"); throw new Error(APP.cancelToken);
+            if (progressCompleted === false || isUserCancellation(progressResult)) {
+                generationProgress.cancel();
+                throw userCancellationError();
             }
             if (!progressResult) throw new Error(cardText(str.errNoResult));
             if (progressResult.type == "error") throw new Error(progressResult.message);
@@ -1388,40 +1434,95 @@ function GenerationRuntime() {
 }
 
 function GenerationProgress() {
-    var payload = null, res = null, firstAnswer = null, prepareTitle = "", generateTitle = "", delayKey = "", delayMax = GENERATION_RUN_DEFAULT_EXPECTED_MS, requestId = null;
+    var payload = null,
+        res = null,
+        firstAnswer = null,
+        prepareTitle = "",
+        generateTitle = "",
+        delayKey = "",
+        delayMax = GENERATION_RUN_DEFAULT_EXPECTED_MS,
+        requestId = null, cancellationRequested = false;
     this.begin = function (options) {
-        options = options || {}; payload = options.command || null; res = null; firstAnswer = null;
+        options = options || {};
+        payload = options.command || null;
+        cancellationRequested = false;
+        res = null;
+        firstAnswer = null;
         prepareTitle = options.titles && options.titles.prepare ? options.titles.prepare : "";
         generateTitle = options.titles && options.titles.generate ? options.titles.generate : "";
-        delayKey = options.timingKey || ""; delayMax = options.timingMax || GENERATION_RUN_DEFAULT_EXPECTED_MS; requestId = options.requestId || (payload ? payload.request_id : null);
+        delayKey = options.timingKey || "";
+        delayMax = options.timingMax || GENERATION_RUN_DEFAULT_EXPECTED_MS;
+        requestId = options.requestId || (payload ? payload.request_id : null);
     };
     this.run = function () {
-        if (!app.doProgressSegmentTask(GENERATION_PREPARE_SEGMENT, 0, GENERATION_TOTAL_SEGMENTS, "generationStageOne()")) {
-            $.setenv(APP.dialogEnvKey, "true"); api.interrupt(requestId); throw new Error(APP.cancelToken);
+        try {
+            if (!app.doProgressSegmentTask(
+                GENERATION_PREPARE_SEGMENT, 0, GENERATION_TOTAL_SEGMENTS,
+                "generationStageOne()"
+            )) return cancelProgress();
+            if (!firstAnswer || firstAnswer.type == "error" || firstAnswer.message != "init") {
+                res = firstAnswer;
+                return true;
+            }
+            if (!app.doProgressSegmentTask(
+                GENERATION_RUN_SEGMENT, GENERATION_PREPARE_SEGMENT,
+                GENERATION_TOTAL_SEGMENTS,
+                "generationStageTwo()"
+            )) return cancelProgress();
+            return true;
+        } catch (progressError) {
+            if (cancellationRequested) throw progressError;
+            if (!isUserCancellation(progressError)) { api.cancelGeneration(requestId); throw progressError; }
+            return cancelProgress();
         }
-        if (!firstAnswer || firstAnswer.type == "error" || firstAnswer.message != "init") { res = firstAnswer; return true; }
-        if (!app.doProgressSegmentTask(GENERATION_RUN_SEGMENT, GENERATION_PREPARE_SEGMENT, GENERATION_TOTAL_SEGMENTS, "generationStageTwo()")) {
-            $.setenv(APP.dialogEnvKey, "true"); api.interrupt(requestId); throw new Error(APP.cancelToken);
-        }
+    };
+    this.cancel = function () {
+        return cancellationRequested ? false : cancelProgress();
+    };
+    function cancelProgress() {
+        cancellationRequested = true;
+        res = { type: "cancelled", message: "" };
+        api.cancelGeneration(requestId);
+        return false;
+    }
+    this.stageOne = function () {
+        // Подготовка использует тот же пользовательский timeout, что и основная
+        // стадия: удалённый сервис может долго загружать файл или модель.
+        var prepareTimeout = cfg.generationTimeout * 1000,
+            answer = api.startGeneration({
+                command: payload,
+                timeout: prepareTimeout,
+                title: prepareTitle || str.progressPrepare,
+                max: GENERATION_PREPARE_EXPECTED_MS,
+                progressCurve: "hyperbolic"
+            });
+        if (answer === false) return false;
+        firstAnswer = answer;
         return true;
     };
-    this.stageOne = function () {
-        var answer = api.startGeneration({
-            command: payload,
-            timeout: 120000,
-            title: prepareTitle || str.progressPrepare,
-            max: GENERATION_PREPARE_EXPECTED_MS,
-            progressCurve: "hyperbolic"
-        });
-        if (answer === false) return false; firstAnswer = answer; return true;
-    };
     this.stageTwo = function () {
-        var answer = api.finishGeneration({ timeout: cfg.generationTimeout * 1000, title: generateTitle || str.progressGenerate, max: delayMax, delayKey: delayKey, requestId: requestId });
-        res = answer === false ? false : answer; return answer !== false;
+        var answer = api.finishGeneration({
+            timeout: cfg.generationTimeout * 1000,
+            title: generateTitle || str.progressGenerate,
+            max: delayMax,
+            delayKey: delayKey,
+            requestId: requestId
+        });
+        res = answer === false ? false : answer;
+        return answer !== false;
     };
     this.getResult = function () { return res; };
     this.getRequestId = function () { return requestId; };
-    this.clear = function () { payload = null; res = null; firstAnswer = null; prepareTitle = ""; generateTitle = ""; delayKey = ""; delayMax = GENERATION_RUN_DEFAULT_EXPECTED_MS; requestId = null; };
+    this.clear = function () {
+        payload = null;
+        res = null;
+        firstAnswer = null;
+        prepareTitle = "";
+        generateTitle = "";
+        delayKey = "";
+        delayMax = GENERATION_RUN_DEFAULT_EXPECTED_MS;
+        requestId = null, cancellationRequested = false;
+    };
 }
 function prepareSelectionLayer(selection) { return generation.prepareSelectionLayer(selection); }
 function checkSelection(res) { return generation.checkSelection(res); }
@@ -1492,9 +1593,24 @@ function BridgeApi() {
                 running = false;
             }
             if (running) {
-                validatePythonProtocol(runningInfo);
-                waitForPythonReady(runningInfo, progress, deadline);
-                return true;
+                // Совместимый, но устаревший Remote API процесс просим завершиться
+                // перед запуском новой версии Python-моста.
+                var runningBuildId = String(runningInfo && runningInfo.build_id || "");
+                if (runningBuildId &&
+                    String(runningInfo && runningInfo.app_id || "") == API_APP_ID &&
+                    String(runningInfo && runningInfo.protocol) == String(API_PROTOCOL) &&
+                    runningBuildId != String(API_BUILD_ID)) {
+                    try { call("shutdown", null, SHORT_TIMEOUT, progress); } catch (_) { }
+                    var stopDeadline = (new Date()).getTime() + 3000;
+                    while (self.isRunning() && (new Date()).getTime() < stopDeadline) $.sleep(50);
+                    if (self.isRunning()) validatePythonProtocol(runningInfo);
+                    running = false;
+                    runningInfo = null;
+                } else {
+                    validatePythonProtocol(runningInfo);
+                    waitForPythonReady(runningInfo, progress, deadline);
+                    return true;
+                }
             }
         }
         var pythonFile = findPythonModule();
@@ -1522,6 +1638,11 @@ function BridgeApi() {
     this.translate = function (text, progress) { return call("translate", { text: text || "" }, TRANSLATE_TIMEOUT, progress); };
     this.handshake = function (progress) { return call("handshake", {}, SHORT_TIMEOUT, progress); };
     this.encryptCredential = function (providerId, secret) { return call("credential_encrypt", { provider_id: providerId, secret: secret || "" }, SHORT_TIMEOUT); };
+    this.cancelGeneration = function (requestId) {
+        if (!requestId) return;
+        try { return call("cancel_generation", { request_id: requestId }, 30000); }
+        catch (e) { self.interrupt(requestId); throw e; }
+    };
     this.interrupt = function (requestId) {
         try { fire(makeCommand("interrupt", { request_id: requestId || "" }, requestId)); } catch (_) { }
     };
@@ -1532,6 +1653,8 @@ function BridgeApi() {
             title: options.title,
             max: options.max,
             progressCurve: options.progressCurve,
+            trackDelay: true,
+            delayKey: options.delayKey,
             interruptOnTimeout: true
         });
     };
@@ -1604,30 +1727,29 @@ function BridgeApi() {
         for (; ;) {
             t2 = (new Date()).getTime();
             if (t2 - t1 > timeout) {
-                if (interruptOnTimeout && expectedRequestId) {
-                    try { self.interrupt(expectedRequestId); } catch (_) { }
-                }
                 listener.close();
+                if (interruptOnTimeout && expectedRequestId) self.cancelGeneration(expectedRequestId);
                 throw new Error(cardText(str.errApiTimeout));
             }
-            if (progress) progress.pulse();
-            if (title && t2 - t3 >= 1) {
-                var progressDelta = t2 - t3;
-                if (progressDelta > 0 && progressCurve == "hyperbolic")
-                    slice = progressDelta / (max + t2 - t1);
-                else slice = progressDelta > 0
-                    ? 1 - Math.pow(1 - PROGRESS_STAGE_TARGET, progressDelta / max)
-                    : 0;
-                t3 = t2;
-                var text = trackDelay
-                    ? title + "\t " + Math.floor((t2 - t1) / 100) / 10 + " s. "
-                    : title;
-                if (!app.doProgressTask(slice, "progressWorkChunk('" + escapeProgressText(text) + "');")) {
-                    $.setenv(APP.dialogEnvKey, "true");
-                    try { self.interrupt(expectedRequestId); } catch (_) { }
-                    listener.close();
-                    return false;
+            if (t2 - t3 >= API_POLL_INTERVAL) {
+                if (progress) progress.pulse();
+                if (title) {
+                    var progressDelta = t2 - t3;
+                    if (progressDelta > 0 && progressCurve == "hyperbolic")
+                        slice = progressDelta / (max + t2 - t1);
+                    else slice = progressDelta > 0
+                        ? 1 - Math.pow(1 - PROGRESS_STAGE_TARGET, progressDelta / max)
+                        : 0;
+                    var text = trackDelay
+                        ? title + "\t " + Math.floor((t2 - t1) / 100) / 10 + " s. "
+                        : title;
+                    if (!app.doProgressTask(slice, "progressWorkChunk('" + escapeProgressText(text) + "');")) {
+                        // GenerationProgress.cancelProgress() отправит interrupt один раз.
+                        listener.close();
+                        return false;
+                    }
                 }
+                t3 = t2;
             }
             var connection = listener.poll();
             if (connection != null) {
@@ -1649,12 +1771,12 @@ function BridgeApi() {
                 }
                 if (expectedRequestId && String(answer.request_id || "") != String(expectedRequestId)) continue;
                 listener.close();
-                if (trackDelay && delayKey) {
+                if (trackDelay && delayKey && interfaceWasShown) {
                     try { generationTimings.saveDelay(delayKey, t2 - t1); } catch (_) { }
                 }
                 return answer;
             }
-            $.sleep(1);
+            $.sleep(API_POLL_SLEEP);
         }
     }
     this.workChunk = function (text) {
@@ -1714,6 +1836,10 @@ function BridgeApi() {
         if (String(info && info.protocol) != String(API_PROTOCOL))
             throw new Error(cardText(str.errApiProtocolA) + (info ? info.protocol : "") +
                 cardText(str.errApiProtocolB) + API_PROTOCOL + ".");
+        var buildId = String(info && info.build_id || "");
+        if (buildId && buildId != String(API_BUILD_ID))
+            throw new Error("An outdated Remote API img2img helper Python API is still running on port " +
+                API_PORT_SEND + ". Expected build " + API_BUILD_ID + ", received " + buildId + ".");
     }
     function ensureStartupProgress(progress) {
         if (progress) return progress;
@@ -1755,7 +1881,7 @@ function BridgeApi() {
     function startupStatusFile() {
         var root = "";
         try { root = String($.getenv("LOCALAPPDATA") || ""); } catch (_) { }
-        return root ? new File(root + "/" + APP.tempFolder + "/" + APP.startupFile) : null;
+        return root ? new File(root + "/JazzyScripts/" + APP.tempFolder + "/" + APP.startupFile) : null;
     }
     function startupLogPath() {
         var statusFile = startupStatusFile();
@@ -1990,9 +2116,7 @@ function Config() {
         // selectedProvider, selectedModel и modelProfiles намеренно не копируются:
         // снимок выбранной модели из Action не должен менять обычный запуск.
         var globalKeys = [
-            "autoResize", "resizePresets", "flatten", "rasterizeImage",
-            "keepAspectRatioDuringPlace", "recordSettingsToAction",
-            "writeLayerMetadata", "selectBrush", "brushOpacity",
+            "recordSettingsToAction", "writeLayerMetadata",
             "generationTimeout", "providerCredentials", "referenceHistory",
             "promptPresets"
         ];
@@ -2026,6 +2150,11 @@ function Config() {
             reference: String(profile.reference || "")
         };
     }
+    var imageKeys = ["autoResize", "resizePresets", "flatten", "rasterizeImage", "keepAspectRatioDuringPlace", "selectBrush", "brushOpacity"];
+    this.exportSnapshot = function (file) {
+        syncData();
+        writeSettingsStream(file, descriptorCodec.toDescriptor(actionData(true)).toStream());
+    };
     function actionData(recordMode) {
         var enabled = recordMode === undefined ? !!self.recordSettingsToAction : !!recordMode,
             res = {
@@ -2038,6 +2167,8 @@ function Config() {
         res.selectedProvider = String(self.selectedProvider || "");
         res.selectedModel = modelId;
         res.modelProfile = modelProfileData(profile);
+        res.imageSettings = {};
+        for (var si = 0; si < imageKeys.length; si++) res.imageSettings[imageKeys[si]] = cloneObj(self[imageKeys[si]]);
         return res;
     }
     function settingsFile(suffix) { return new File(app.preferencesFolder + "/" + APP.settingsFile + (suffix || "")); }
@@ -2091,13 +2222,22 @@ function Config() {
         if (!loaded && incompatible) loadWarnings.push(cardText(str.settingsVersionReset));
         applyLoadedData(loaded);
     };
-    this.loadModelFromAction = function () {
+    this.loadModelFromAction = function (sourceFile) {
         var loaded = {};
-        try { descriptorCodec.readInto(loaded, app.playbackParameters); } catch (_) { loaded = {}; }
-        if (!isObjectMap(loaded) || Number(loaded.actionDataVersion) != ACTION_DATA_VERSION ||
+        if (sourceFile) loaded = readSettingsData(sourceFile);
+        else try { descriptorCodec.readInto(loaded, app.playbackParameters); } catch (_) { loaded = {}; }
+        if (!isObjectMap(loaded) || (Number(loaded.actionDataVersion) != ACTION_DATA_VERSION && Number(loaded.actionDataVersion) != 4) ||
             loaded.recordSettingsToAction !== true || !loaded.selectedProvider ||
             !loaded.selectedModel || !isObjectMap(loaded.modelProfile))
             throw new Error(cardText(str.errActionSettingsVersion));
+        if (Number(loaded.actionDataVersion) >= 5) {
+            if (!isObjectMap(loaded.imageSettings)) throw new Error(cardText(str.errActionSettingsVersion));
+            for (var si = 0; si < imageKeys.length; si++) {
+                var sk = imageKeys[si];
+                if (!loaded.imageSettings.hasOwnProperty(sk)) throw new Error(cardText(str.errActionSettingsVersion));
+                self[sk] = self.data[sk] = cloneObj(loaded.imageSettings[sk]);
+            }
+        }
         self.selectedProvider = self.data.selectedProvider = String(loaded.selectedProvider);
         self.selectedModel = self.data.selectedModel = String(loaded.selectedModel);
         if (!isObjectMap(self.modelProfiles)) self.modelProfiles = self.data.modelProfiles = {};
@@ -2176,10 +2316,27 @@ function ActionRuntime() {
             return !!(desc && desc.hasKey(marker));
         } catch (_) { return false; }
     };
-    this.hasInterfaceArgument = function () {
-        var values = []; try { if ($.arguments && $.arguments.length) for (var i = 0; i < $.arguments.length; i++) values.push($.arguments[i]); } catch (_) { }
-        for (var j = 0; j < values.length; j++) { var value = String(values[j]).toLowerCase(); if (value == "dialog" || value == "ui" || value == "--dialog" || value == "--ui" || value == "/dialog" || value == "/ui") return true; }
-        return false;
+    this.readLaunchArguments = function () {
+        var values = topLevelArguments.slice(0), result = { dialog: false, file: null };
+        try { if ($.arguments) for (var i = 0; i < $.arguments.length; i++) values.push($.arguments[i]); } catch (_) { }
+        try {
+            var desc = app.playbackParameters, names = ["scriptArgs", "args"];
+            for (var j = 0; j < names.length; j++) {
+                var key = s2t(names[j]);
+                if (desc.hasKey(key) && desc.getType(key) == DescValueType.STRINGTYPE) values.push(desc.getString(key));
+            }
+        } catch (_) { }
+        for (var k = 0; k < values.length; k++) {
+            var v = trimText(values[k]).replace(/^"|"$/g, "");
+            if (/^(--?|\/)?(dialog|ui)$/i.test(v)) result.dialog = true;
+            else if (/\.desc$/i.test(v)) {
+                filePlaybackMode = true;
+                var file = new File(v);
+                if (!file.exists) throw new Error("Settings file not found: " + v);
+                result.file = file;
+            }
+        }
+        return result;
     };
     this.getRecordedSettingsMode = function () {
         try {
@@ -2188,6 +2345,7 @@ function ActionRuntime() {
         } catch (_) { return false; }
     };
     this.saveAcceptedSettings = function () {
+        if (filePlaybackMode) return;
         if (actionPlaybackMode) {
             if (actionUsesRecordedSettings) {
                 // Обновляем только снимок выбранной модели в текущем Action.
@@ -2206,6 +2364,7 @@ function ActionRuntime() {
         cfg.saveToAction();
     };
     this.saveAfterGeneration = function () {
+        if (filePlaybackMode) return;
         if (actionPlaybackMode) {
             if (actionUsesRecordedSettings) cfg.saveToAction(true);
             else { cfg.save(); cfg.saveToAction(false); }
@@ -2214,7 +2373,8 @@ function ActionRuntime() {
         cfg.save();
     };
     this.saveAfterError = function () {
-        if (!settingsReady) return "";
+        // До показа интерфейса тихий запуск не изменяет DESC или Action.
+        if (!settingsReady || !interfaceWasShown) return "";
         try { this.saveAcceptedSettings(); return ""; }
         catch (saveError) { return errorMessageText(saveError) + (saveError && saveError.line ? " (" + cardText(str.jsxLine) + saveError.line + ")" : ""); }
     };
@@ -2467,7 +2627,7 @@ function Delay() {
         try { var desc = getCustomOptions(APP.uuid); } catch (_) { }
         if (desc != undefined) descriptorCodec.readInto(settingsObj, desc);
         if (settingsObj[key]) { var sum = 0; for (var i = 0; i < settingsObj[key].length; i++) sum += settingsObj[key][i]; sum = Math.round(sum / settingsObj[key].length); return sum < 1000 ? 1000 : sum; }
-        return 15000;
+        return GENERATION_RUN_DEFAULT_EXPECTED_MS;
     };
     this.saveDelay = function (key, delay) {
         if (!key) return; delay = Math.max(1, Math.round(Number(delay) || 0));
@@ -2637,18 +2797,55 @@ function createSliderStepper(slider, step, origin) {
     if (!isFinite(step) || step <= 0) step = 1;
     origin = Number(origin);
     if (!isFinite(origin)) origin = Number(slider.minvalue) || 0;
-    var state = { slider: slider, step: step, origin: origin, snappedValue: null, pointerActive: false };
-    try { slider.addEventListener("mousedown", function () { state.pointerActive = true; }); } catch (_) { }
+    var state = {
+        slider: slider,
+        step: step,
+        origin: origin,
+        snappedValue: null,
+        shiftTarget: null,
+        pointerActive: false
+    };
+    try { slider.addEventListener("mousedown", function () { state.shiftTarget = null; state.pointerActive = true; }); } catch (_) { }
+    try {
+        slider.addEventListener("keydown", function (event) {
+            state.shiftTarget = null;
+            if (!event || !event.shiftKey) return;
+            var key = String(event.keyName || event.keyIdentifier || ""), direction = 0;
+            if (key == "Right" || key == "Up" || key == "ArrowRight" || key == "ArrowUp") direction = 1;
+            else if (key == "Left" || key == "Down" || key == "ArrowLeft" || key == "ArrowDown") direction = -1;
+            if (!direction) return;
+            var minimum = Number(slider.minvalue), maximum = Number(slider.maxvalue),
+                base = state.snappedValue === null ? roundByStep(Number(slider.value), step, origin) : state.snappedValue,
+                target = clamp(roundByStep(base + direction * step * 5, step, origin), minimum, maximum);
+            state.shiftTarget = target;
+            slider.value = clamp(target - direction * Math.min(step, maximum - minimum), minimum, maximum);
+        });
+    } catch (_) { }
     state.sync = function (reset) {
-        var raw = Number(slider.value), previous = reset ? null : state.snappedValue, value;
-        if (!state.pointerActive && previous !== null && raw != previous)
+        if (reset) state.shiftTarget = null;
+        var raw = Number(slider.value),
+            previous = reset ? null : state.snappedValue,
+            value;
+        if (!reset && state.shiftTarget !== null) {
+            value = state.shiftTarget;
+            state.shiftTarget = null;
+        } else if (!state.pointerActive && previous !== null && raw != previous)
             value = roundByStep(previous + (raw > previous ? step : -step), step, origin);
         else value = roundByStep(raw, step, origin);
         value = clamp(value, Number(slider.minvalue), Number(slider.maxvalue));
-        slider.value = value; state.snappedValue = value; return value;
+        slider.value = value;
+        state.snappedValue = value;
+        return value;
     };
-    state.reset = function (value) { if (value !== undefined) slider.value = value; return state.sync(true); };
-    state.finish = function () { var value = state.sync(false); state.pointerActive = false; return value; };
+    state.reset = function (value) {
+        if (value !== undefined) slider.value = value;
+        return state.sync(true);
+    };
+    state.finish = function () {
+        var value = state.sync(false);
+        state.pointerActive = false;
+        return value;
+    };
     state.sync(true);
     return state;
 }
@@ -2661,15 +2858,38 @@ function cloneObj(source) {
     var res = {}; for (var key in source) if (source.hasOwnProperty(key)) res[key] = cloneObj(source[key]); return res;
 }
 function jsonStringify(value) {
-    if (value === null) return "null";
-    if (value === undefined || typeof value == "function") return undefined;
-    if (typeof value == "string") return '"' + escapeJsonString(value) + '"';
-    if (typeof value == "number") return isFinite(value) ? String(value) : "null";
-    if (typeof value == "boolean") return value ? "true" : "false";
-    if (value instanceof Array) { var arr = []; for (var i = 0; i < value.length; i++) { var item = jsonStringify(value[i]); arr.push(item === undefined ? "null" : item); } return "[" + arr.join(",") + "]"; }
-    var parts = []; for (var key in value) if (value.hasOwnProperty(key)) { var encoded = jsonStringify(value[key]); if (encoded !== undefined) parts.push('"' + escapeJsonString(key) + '":' + encoded); }
-    return "{" + parts.join(",") + "}";
+    if (value === null || value === undefined) return "null";
+    var type = typeof value;
+    if (type == "string") return "\"" + escapeJsonString(value) + "\"";
+    if (type == "number") return isFinite(value) ? String(value) : "null";
+    if (type == "boolean") return value ? "true" : "false";
+    if (value instanceof Array) {
+        var array = [];
+        for (var i = 0; i < value.length; i++) array.push(jsonStringify(value[i]));
+        return "[" + array.join(",") + "]";
+    }
+    if (type == "object") {
+        var fields = [], key;
+        for (key in value) if (value.hasOwnProperty(key) && typeof value[key] != "function")
+            fields.push("\"" + escapeJsonString(key) + "\":" + jsonStringify(value[key]));
+        return "{" + fields.join(",") + "}";
+    }
+    return "null";
 }
-function escapeJsonString(value) { return String(value).replace(/\\/g, "\\\\").replace(/\"/g, '\\"').replace(/\r/g, "\\r").replace(/\n/g, "\\n").replace(/\t/g, "\\t").replace(/[\u0000-\u001f]/g, function (ch) { var hex = ch.charCodeAt(0).toString(16); while (hex.length < 4) hex = "0" + hex; return "\\u" + hex; }); }
-function jsonParse(text) { if (typeof JSON != "undefined" && JSON.parse) return JSON.parse(text); return eval("(" + text + ")"); }
-
+function escapeJsonString(value) {
+    return String(value)
+        .replace(/\\/g, "\\\\")
+        .replace(/\"/g, "\\\"")
+        .replace(/\r/g, "\\r")
+        .replace(/\n/g, "\\n")
+        .replace(/\t/g, "\\t")
+        .replace(/[\x00-\x1f]/g, function (character) {
+            var code = character.charCodeAt(0).toString(16);
+            while (code.length < 4) code = "0" + code;
+            return "\\u" + code;
+        });
+}
+function jsonParse(text) {
+    if (text === null || text === undefined || text === "") return null;
+    return eval("(" + text + ")");
+}
