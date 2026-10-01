@@ -34,7 +34,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          JSX_FILE="Remote API img2img helper.jsx"
+          JSX_FILE="Photoshop-files/Remote API img2img helper.jsx"
           JSX_VERSION="$(sed -nE 's/^[[:space:]]*VER[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "${JSX_FILE}" | head -n 1)"
 
           if [ -z "${JSX_VERSION}" ]; then
@@ -79,9 +79,9 @@ jobs:
           rm -rf dist
           mkdir -p "${PACKAGE_DIR}"
 
-          cp "Remote API img2img helper.jsx" "${PACKAGE_DIR}/"
+          cp "install_runtime.bat" "${PACKAGE_DIR}/"
           cp "README.md" "${PACKAGE_DIR}/"
-          cp -R "lib" "${PACKAGE_DIR}/"
+          cp -R "Photoshop-files" "${PACKAGE_DIR}/"
           cp -R "advanced" "${PACKAGE_DIR}/"
 
           find "${PACKAGE_DIR}" -type d -name "__pycache__" -prune -exec rm -rf {} +
